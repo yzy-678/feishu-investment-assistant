@@ -1,0 +1,26 @@
+name: 收盘复盘 (16:00 CST)
+
+on:
+  schedule:
+    - cron: '0 8 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Generate closing report
+        run: python -m src.scheduler.tasks closing
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          ADMIN_USER_OPEN_ID: ${{ secrets.ADMIN_USER_OPEN_ID }}
+          LOG_LEVEL: INFO
+          DATA_SOURCE: mock

@@ -1,0 +1,35 @@
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# ── 环境变量 ────────────────────────────────────────────
+.env
+.venv/
+venv/
+
+# ── IDE ─────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── 项目运行时文件 ─────────────────────────────────────
+config/investment.db
+config/*.db
+config/*.db-journal
+config/*.db-wal
+config/*.db-shm
+logs/
+data/
+*.log
+
+# ── Docker ──────────────────────────────────────────────
+.docker/
