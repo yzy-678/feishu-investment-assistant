@@ -52,8 +52,8 @@ class Settings(BaseSettings):
     database_path: str = "config/investment.db"
     """SQLite 数据库文件路径（相对于项目根目录）"""
 
-    data_source: str = "mock"
-    """行情数据源：mock / eastmoney / yahoo"""
+    data_source: str = "eastmoney"
+    """行情数据源：eastmoney / mock / yahoo"""
 
     model_config = {
         "env_file": str(Path(__file__).resolve().parent.parent.parent / ".env"),

@@ -6,13 +6,15 @@
 """
 
 import logging
-from datetime import date
 from enum import Enum
 from typing import Optional
 
 from src.agents.base import BaseAgent, AgentType, AgentResponse
 from src.ai.deepseek import DeepSeekError, get_deepseek
 from src.config.manager import get_config
+from src.config.settings import settings
+from src.market import MarketDataError, get_market_data_service
+from src.time_utils import shanghai_now
 from src.watchlist.manager import WatchlistError, get_watchlist
 
 logger = logging.getLogger(__name__)
@@ -71,6 +73,7 @@ class ReportAgent(BaseAgent):
         self.deepseek = get_deepseek()
         self.config = get_config()
         self.watchlist = get_watchlist()
+        self.market_data = get_market_data_service()
         self._initialized = True
         logger.info("ReportAgent initialized")
 
@@ -157,14 +160,20 @@ class ReportAgent(BaseAgent):
     def _build_report_prompt(self, report_type: ReportType) -> str:
         """构建带上下文注入的报告生成提示词"""
         market = self.config.get_market()
-        today = date.today().isoformat()
+        now = shanghai_now()
+        today = now.date().isoformat()
+        now_text = now.strftime("%Y-%m-%d %H:%M:%S")
         watchlist_ctx = self._build_watchlist_context()
+        market_snapshot = self._build_market_snapshot_context(market)
+        data_note = self._build_data_note(market)
 
         prompt = (
             f"你是一个专业的投资分析助手。请生成{report_type.display_name}（{report_type.timeframe}）。\n\n"
             f"【基本信息】\n"
             f"日期：{today}\n"
+            f"当前时间（Asia/Shanghai）：{now_text}\n"
             f"当前市场：{market}\n\n"
+            f"{market_snapshot}\n\n"
             f"{watchlist_ctx}\n\n"
             f"请按以下 Markdown 格式输出报告：\n\n"
             f"## 【{report_type.display_name}】{today}\n\n"
@@ -178,7 +187,7 @@ class ReportAgent(BaseAgent):
             f"（自选股整体表现、重点关注个股）\n\n"
             f"### 操作关注点\n"
             f"（今日或明日操作建议、关键价位）\n\n"
-            f"注意：基于模拟数据，分析仅供参考，不构成投资建议。"
+            f"{data_note}"
         )
 
         return prompt
@@ -204,6 +213,27 @@ class ReportAgent(BaseAgent):
         except Exception:
             logger.warning("Failed to load watchlist for report prompt")
             return "（自选股信息暂不可用）"
+
+    def _build_market_snapshot_context(self, market: str) -> str:
+        """构建实时市场快照上下文。"""
+        if settings.data_source.strip().lower() != "eastmoney":
+            return "【市场快照】当前仍在使用 mock 数据源。"
+
+        try:
+            items = self.watchlist.list_stocks()
+            return self.market_data.build_market_snapshot_text(
+                market=market,
+                watchlist_items=items,
+            )
+        except (MarketDataError, WatchlistError, Exception) as exc:
+            logger.warning("Failed to build report market snapshot: %s", exc)
+            return f"【市场快照】实时行情暂不可用：{exc}"
+
+    @staticmethod
+    def _build_data_note(market: str) -> str:
+        if settings.data_source.strip().lower() == "eastmoney" and market == "CN":
+            return "注意：以上分析基于实时 A 股快照生成，仅供参考，不构成投资建议。"
+        return "注意：当前仍为模拟/降级数据，分析仅供参考，不构成投资建议。"
 
 
 # ── 全局单例访问函数 ─────────────────────────────────────

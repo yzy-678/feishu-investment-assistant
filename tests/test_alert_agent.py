@@ -18,6 +18,7 @@ from src.agents.alert_agent import (
 )
 from src.agents.base import AgentType
 from src.db.models import AlertEvent, AlertSeverity, WatchlistItem
+from src.market import QuoteSnapshot
 
 
 # ---- Fixtures ----------------------------------------------------------------
@@ -448,19 +449,41 @@ class TestScanning:
         assert result["deliverable"] == 0
         assert "暂无自选股" in result["message"]
 
-    def test_scan_watchlist_non_mock(self, agent, monkeypatch):
+    def test_scan_watchlist_eastmoney_without_signal(self, agent, monkeypatch):
         monkeypatch.setattr("src.agents.alert_agent.settings.data_source", "eastmoney")
-        with patch.object(agent.watchlist, "list_stocks", return_value=[
-            WatchlistItem(
-                id=1, symbol="000001", name="平安银行", market="a",
-                tags="", notes="", added_at=datetime.now(),
-            )
-        ]):
+        with (
+            patch.object(agent.watchlist, "list_stocks", return_value=[
+                WatchlistItem(
+                    id=1, symbol="000001", name="平安银行", market="a",
+                    tags="", notes="", added_at=datetime.now(),
+                )
+            ]),
+            patch.object(
+                agent.market_data,
+                "get_quote",
+                return_value=QuoteSnapshot(
+                    symbol="000001",
+                    name="平安银行",
+                    price=10.52,
+                    change=-0.05,
+                    change_pct=-0.48,
+                    open_price=10.55,
+                    high_price=10.60,
+                    low_price=10.50,
+                    prev_close=10.57,
+                    volume=100000,
+                    amount=98000000,
+                    amplitude_pct=0.95,
+                    turnover_rate=0.42,
+                    fetched_at="2026-06-22 10:00:00",
+                ),
+            ),
+        ):
             result = agent.scan_watchlist()
 
         assert result["scanned"] == 1
         assert result["triggered"] == 0
-        assert "暂未接入盘中扫描" in result["message"]
+        assert "未发现新的盘中预警" in result["message"]
 
     def test_scan_watchlist_generates_deliverable_alert(self, agent, monkeypatch):
         monkeypatch.setattr("src.agents.alert_agent.settings.data_source", "mock")
@@ -489,6 +512,43 @@ class TestScanning:
         assert result["triggered"] == 1
         assert result["deliverable"] == 1
         assert result["alerts"][0]["should_send"] is True
+
+    def test_scan_watchlist_eastmoney_generates_alert(self, agent, monkeypatch):
+        monkeypatch.setattr("src.agents.alert_agent.settings.data_source", "eastmoney")
+        with (
+            patch.object(agent.watchlist, "list_stocks", return_value=[
+                WatchlistItem(
+                    id=1, symbol="000001", name="平安银行", market="a",
+                    tags="", notes="", added_at=datetime.now(),
+                )
+            ]),
+            patch.object(
+                agent.market_data,
+                "get_quote",
+                return_value=QuoteSnapshot(
+                    symbol="000001",
+                    name="平安银行",
+                    price=10.52,
+                    change=-0.26,
+                    change_pct=-2.41,
+                    open_price=10.74,
+                    high_price=10.77,
+                    low_price=10.52,
+                    prev_close=10.78,
+                    volume=1426893,
+                    amount=1511009564.95,
+                    amplitude_pct=2.32,
+                    turnover_rate=0.74,
+                    fetched_at="2026-06-22 10:00:00",
+                ),
+            ),
+        ):
+            result = agent.scan_watchlist()
+
+        assert result["scanned"] == 1
+        assert result["triggered"] == 1
+        assert result["deliverable"] == 1
+        assert "平安银行 快速回落" in result["alerts"][0]["event"].title
 
 
 # ---- Singleton tests ---------------------------------------------------------

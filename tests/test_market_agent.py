@@ -52,6 +52,8 @@ def mock_deps():
         patch("src.agents.market_agent.get_memory") as mock_mem,
         patch("src.agents.market_agent.get_watchlist") as mock_wl,
         patch("src.agents.market_agent.get_config") as mock_cfg,
+        patch("src.agents.market_agent.get_market_data_service") as mock_mds,
+        patch("src.agents.market_agent.settings.data_source", "eastmoney"),
     ):
         # DeepSeek mock
         mock_ds_instance = MagicMock()
@@ -73,6 +75,24 @@ def mock_deps():
         mock_cfg_instance.get_market.return_value = "CN"
         mock_cfg.return_value = mock_cfg_instance
 
+        # Market data mock
+        mock_mds_instance = MagicMock()
+        mock_mds_instance.build_market_snapshot_text.return_value = (
+            "【实时 A 股快照】\n"
+            "数据时间（Asia/Shanghai）：2026-06-22 09:30:00\n"
+            "主要指数：\n"
+            "  - 上证指数 3400.00 (+0.80%, +27.00)"
+        )
+        mock_mds_instance.extract_symbol.return_value = None
+        mock_mds_instance.format_quote_detail.return_value = (
+            "000001 平安银行 10.52 (-2.41%)"
+        )
+        mock_mds_instance.get_quote.return_value = MagicMock()
+        mock_mds_instance.get_recent_bars.return_value = [
+            MagicMock(trade_date="2026-06-18", close_price=10.52, change_pct=-2.41, amplitude_pct=2.32)
+        ]
+        mock_mds.return_value = mock_mds_instance
+
         agent = MarketAgent()
         yield {
             "agent": agent,
@@ -80,6 +100,7 @@ def mock_deps():
             "memory": mock_mem_instance,
             "watchlist": mock_wl_instance,
             "config": mock_cfg_instance,
+            "market_data": mock_mds_instance,
         }
 
 
@@ -197,6 +218,7 @@ class TestAnalyzeStock:
         # 验证 prompt 中包含股票代码
         prompt = mock_deps["deepseek"].chat.call_args[0][0][0]["content"]
         assert "000001" in prompt
+        assert "实时个股数据" in prompt
 
     def test_analyze_stock_deepseek_error(self, mock_deps):
         """DeepSeek 异常应向上传递"""
@@ -238,6 +260,7 @@ class TestAnalyzeWatchlist:
         assert "平安银行" in prompt
         assert "贵州茅台" in prompt
         assert "银行" in prompt  # 标签信息应包含
+        assert "实时 A 股快照" in prompt
 
     def test_analyze_watchlist_empty(self, mock_deps):
         """空自选股时直接返回提示"""
@@ -269,6 +292,7 @@ class TestMarketOverview:
         assert result == "A股概况"
         prompt = mock_deps["deepseek"].chat.call_args[0][0][0]["content"]
         assert "CN" in prompt or "A" in prompt
+        assert "实时 A 股快照" in prompt
 
     def test_market_overview_hk(self, mock_deps):
         """港股市场概况"""
@@ -326,6 +350,7 @@ class TestContextBuilding:
         """上下文包含市场信息"""
         ctx = mock_deps["agent"]._build_market_context()
         assert "CN" in ctx
+        assert "实时 A 股快照" in ctx
 
     def test_context_includes_watchlist(self, mock_deps):
         """上下文包含自选股"""

@@ -1,0 +1,334 @@
+"""
+实时行情服务
+
+当前仅接入 A 股 Eastmoney 快照，用于问答上下文、报告和盘中扫描。
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass
+from typing import Iterable, Optional
+
+import httpx
+
+from src.db.models import WatchlistItem
+from src.time_utils import shanghai_now
+
+logger = logging.getLogger(__name__)
+
+EASTMONEY_BASE_URL = "https://push2.eastmoney.com"
+EASTMONEY_HIS_BASE_URL = "https://push2his.eastmoney.com"
+DEFAULT_TIMEOUT = 8.0
+
+CN_INDEX_SECIDS: tuple[tuple[str, str], ...] = (
+    ("1.000001", "上证指数"),
+    ("0.399001", "深证成指"),
+    ("0.399006", "创业板指"),
+)
+
+
+class MarketDataError(Exception):
+    """实时行情获取失败。"""
+
+
+@dataclass(frozen=True)
+class QuoteSnapshot:
+    """单只股票或指数快照。"""
+
+    symbol: str
+    name: str
+    price: float
+    change: float
+    change_pct: float
+    open_price: float
+    high_price: float
+    low_price: float
+    prev_close: float
+    volume: float
+    amount: float
+    amplitude_pct: float
+    turnover_rate: float
+    fetched_at: str
+
+
+@dataclass(frozen=True)
+class DailyBar:
+    """日线摘要。"""
+
+    trade_date: str
+    open_price: float
+    close_price: float
+    high_price: float
+    low_price: float
+    volume: float
+    amount: float
+    amplitude_pct: float
+    change_pct: float
+    change: float
+    turnover_rate: float
+
+
+class MarketDataService:
+    """统一的实时行情访问入口。"""
+
+    def __init__(self, timeout: float = DEFAULT_TIMEOUT) -> None:
+        self.timeout = timeout
+
+    def supports_market(self, market: str) -> bool:
+        return market.strip().upper() == "CN"
+
+    def extract_symbol(self, text: str) -> Optional[str]:
+        """从文本中提取 6 位 A 股代码。"""
+        match = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
+        return match.group(1) if match else None
+
+    def get_quote(self, symbol: str, market: str = "CN") -> QuoteSnapshot:
+        """获取单只 A 股实时快照。"""
+        if not self.supports_market(market):
+            raise MarketDataError(f"当前仅支持 A 股实时行情，收到市场: {market}")
+
+        secid = self._to_secid(symbol)
+        payload = self._request_json(
+            EASTMONEY_BASE_URL,
+            "/api/qt/stock/get",
+            params={
+                "secid": secid,
+                "fields": ",".join(
+                    [
+                        "f57", "f58", "f43", "f44", "f45", "f46", "f47",
+                        "f48", "f60", "f168", "f169", "f170", "f171",
+                    ]
+                ),
+            },
+        )
+        data = payload.get("data") or {}
+        if not data or not data.get("f57"):
+            raise MarketDataError(f"未获取到股票 {symbol} 的实时行情")
+        return self._parse_quote(data)
+
+    def get_index_quotes(self, market: str = "CN") -> list[QuoteSnapshot]:
+        """获取主要指数快照。"""
+        if not self.supports_market(market):
+            return []
+
+        quotes: list[QuoteSnapshot] = []
+        for secid, fallback_name in CN_INDEX_SECIDS:
+            payload = self._request_json(
+                EASTMONEY_BASE_URL,
+                "/api/qt/stock/get",
+                params={
+                    "secid": secid,
+                    "fields": ",".join(
+                        [
+                            "f57", "f58", "f43", "f44", "f45", "f46", "f47",
+                            "f48", "f60", "f168", "f169", "f170", "f171",
+                        ]
+                    ),
+                },
+            )
+            data = payload.get("data") or {}
+            if not data:
+                continue
+            if not data.get("f58"):
+                data["f58"] = fallback_name
+            quotes.append(self._parse_quote(data))
+        return quotes
+
+    def get_recent_bars(
+        self,
+        symbol: str,
+        market: str = "CN",
+        limit: int = 5,
+    ) -> list[DailyBar]:
+        """获取最近 N 个交易日的日线摘要。"""
+        if not self.supports_market(market):
+            raise MarketDataError(f"当前仅支持 A 股日线数据，收到市场: {market}")
+
+        payload = self._request_json(
+            EASTMONEY_HIS_BASE_URL,
+            "/api/qt/stock/kline/get",
+            params={
+                "secid": self._to_secid(symbol),
+                "klt": "101",
+                "fqt": "1",
+                "lmt": str(limit),
+                "end": "20500101",
+                "fields1": "f1,f2,f3",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            },
+        )
+        klines = (payload.get("data") or {}).get("klines") or []
+        bars: list[DailyBar] = []
+        for line in klines:
+            parts = line.split(",")
+            if len(parts) < 11:
+                continue
+            bars.append(
+                DailyBar(
+                    trade_date=parts[0],
+                    open_price=self._to_float(parts[1]),
+                    close_price=self._to_float(parts[2]),
+                    high_price=self._to_float(parts[3]),
+                    low_price=self._to_float(parts[4]),
+                    volume=self._to_float(parts[5]),
+                    amount=self._to_float(parts[6]),
+                    amplitude_pct=self._to_float(parts[7]),
+                    change_pct=self._to_float(parts[8]),
+                    change=self._to_float(parts[9]),
+                    turnover_rate=self._to_float(parts[10]),
+                )
+            )
+        return bars
+
+    def get_watchlist_quotes(
+        self,
+        items: Iterable[WatchlistItem],
+        market: str = "CN",
+    ) -> list[QuoteSnapshot]:
+        """获取自选股实时快照。"""
+        if not self.supports_market(market):
+            return []
+
+        quotes: list[QuoteSnapshot] = []
+        for item in items:
+            if item.market != "a":
+                continue
+            try:
+                quotes.append(self.get_quote(item.symbol, market=market))
+            except MarketDataError as exc:
+                logger.warning("Failed to fetch quote for %s: %s", item.symbol, exc)
+        return quotes
+
+    def build_market_snapshot_text(
+        self,
+        market: str = "CN",
+        watchlist_items: Optional[Iterable[WatchlistItem]] = None,
+        focus_symbol: str = "",
+    ) -> str:
+        """构建适合注入给 AI 的市场快照文本。"""
+        if not self.supports_market(market):
+            return f"【实时行情】当前市场 {market} 暂未接入真实数据源。"
+
+        lines: list[str] = [
+            "【实时 A 股快照】",
+            f"数据时间（Asia/Shanghai）：{shanghai_now().strftime('%Y-%m-%d %H:%M:%S')}",
+        ]
+
+        index_quotes = self.get_index_quotes(market=market)
+        if index_quotes:
+            lines.append("主要指数：")
+            for quote in index_quotes:
+                lines.append(f"  - {self.format_quote_brief(quote, include_symbol=False)}")
+
+        if focus_symbol:
+            try:
+                focus_quote = self.get_quote(focus_symbol, market=market)
+                lines.append("关注个股：")
+                lines.append(f"  - {self.format_quote_detail(focus_quote)}")
+            except MarketDataError as exc:
+                lines.append(f"关注个股：{focus_symbol} 行情暂不可用（{exc}）")
+
+        if watchlist_items:
+            watchlist_list = list(watchlist_items)[:8]
+            watchlist_quotes = self.get_watchlist_quotes(watchlist_list, market=market)
+            if watchlist_quotes:
+                lines.append("自选股快照：")
+                for quote in watchlist_quotes:
+                    lines.append(f"  - {self.format_quote_detail(quote)}")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_quote_brief(quote: QuoteSnapshot, include_symbol: bool = True) -> str:
+        """格式化简短行情。"""
+        prefix = f"{quote.symbol} {quote.name}" if include_symbol else quote.name
+        return (
+            f"{prefix} {quote.price:.2f} "
+            f"({quote.change_pct:+.2f}%, {quote.change:+.2f})"
+        )
+
+    @staticmethod
+    def format_quote_detail(quote: QuoteSnapshot) -> str:
+        """格式化详细行情。"""
+        return (
+            f"{quote.symbol} {quote.name} "
+            f"{quote.price:.2f} ({quote.change_pct:+.2f}%) "
+            f"开/高/低 {quote.open_price:.2f}/{quote.high_price:.2f}/{quote.low_price:.2f} "
+            f"振幅 {quote.amplitude_pct:.2f}% 换手 {quote.turnover_rate:.2f}% "
+            f"成交额 {quote.amount / 100000000:.2f} 亿"
+        )
+
+    def _request_json(
+        self,
+        base_url: str,
+        path: str,
+        params: dict[str, str],
+    ) -> dict:
+        try:
+            with httpx.Client(
+                base_url=base_url,
+                timeout=self.timeout,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": "https://quote.eastmoney.com/",
+                },
+            ) as client:
+                response = client.get(path, params=params)
+                response.raise_for_status()
+                return response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise MarketDataError(str(exc)) from exc
+
+    @staticmethod
+    def _to_secid(symbol: str) -> str:
+        normalized = symbol.strip()
+        if not re.fullmatch(r"\d{6}", normalized):
+            raise MarketDataError(f"仅支持 6 位 A 股代码，收到: {symbol}")
+        market = "1" if normalized.startswith(("5", "6", "9")) else "0"
+        return f"{market}.{normalized}"
+
+    @staticmethod
+    def _parse_quote(data: dict) -> QuoteSnapshot:
+        return QuoteSnapshot(
+            symbol=str(data.get("f57", "")),
+            name=str(data.get("f58", "")),
+            price=MarketDataService._scaled_price(data.get("f43")),
+            change=MarketDataService._scaled_price(data.get("f169")),
+            change_pct=MarketDataService._scaled_pct(data.get("f170")),
+            open_price=MarketDataService._scaled_price(data.get("f46")),
+            high_price=MarketDataService._scaled_price(data.get("f44")),
+            low_price=MarketDataService._scaled_price(data.get("f45")),
+            prev_close=MarketDataService._scaled_price(data.get("f60")),
+            volume=MarketDataService._to_float(data.get("f47")),
+            amount=MarketDataService._to_float(data.get("f48")),
+            amplitude_pct=MarketDataService._scaled_pct(data.get("f171")),
+            turnover_rate=MarketDataService._scaled_pct(data.get("f168")),
+            fetched_at=shanghai_now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+    @staticmethod
+    def _scaled_price(raw: object) -> float:
+        return round(MarketDataService._to_float(raw) / 100, 2)
+
+    @staticmethod
+    def _scaled_pct(raw: object) -> float:
+        return round(MarketDataService._to_float(raw) / 100, 2)
+
+    @staticmethod
+    def _to_float(raw: object) -> float:
+        if raw in (None, "-", ""):
+            return 0.0
+        return float(raw)
+
+
+_market_data_service_instance: Optional[MarketDataService] = None
+
+
+def get_market_data_service() -> MarketDataService:
+    """获取实时行情服务单例。"""
+    global _market_data_service_instance  # noqa: PLW0603
+    if _market_data_service_instance is None:
+        _market_data_service_instance = MarketDataService()
+    return _market_data_service_instance

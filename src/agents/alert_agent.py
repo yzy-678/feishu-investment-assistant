@@ -16,6 +16,8 @@ from src.config.manager import get_config
 from src.config.settings import settings
 from src.db import get_database
 from src.db.models import AlertEvent, AlertSeverity, WatchlistItem
+from src.market import MarketDataError, QuoteSnapshot, get_market_data_service
+from src.time_utils import shanghai_now_naive
 from src.watchlist.manager import get_watchlist
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,7 @@ class AlertAgent(BaseAgent):
         self._db = get_database()
         self.config = get_config()
         self.watchlist = get_watchlist()
+        self.market_data = get_market_data_service()
         self._lock = threading.Lock()
         self._initialized = True
         logger.info("AlertAgent initialized (cooldown=%dmin, escalation=%.0f%%)",
@@ -146,7 +149,7 @@ class AlertAgent(BaseAgent):
         """
         with self._lock:
             existing = self._find_event(event_id)
-            now = datetime.now()
+            now = shanghai_now_naive()
 
             try:
                 conn = self._db.get_connection()
@@ -218,7 +221,7 @@ class AlertAgent(BaseAgent):
         if existing.resolved:
             return (True, "resolved")
 
-        now = datetime.now()
+        now = shanghai_now_naive()
 
         if existing.last_sent is not None:
             elapsed = (now - existing.last_sent).total_seconds() / 60.0
@@ -238,7 +241,7 @@ class AlertAgent(BaseAgent):
         with self._lock:
             try:
                 conn = self._db.get_connection()
-                now = datetime.now()
+                now = shanghai_now_naive()
                 conn.execute(
                     """UPDATE alert_events
                        SET last_sent = ?, sent_count = sent_count + 1
@@ -292,8 +295,7 @@ class AlertAgent(BaseAgent):
     def scan_watchlist(self) -> dict[str, Any]:
         """执行一次最小可用的预警扫描。
 
-        当前仅为 `mock` 数据源生成稳定的模拟预警信号，
-        其余数据源先返回明确的未接入说明，便于后续接真行情。
+        `mock` 使用稳定模拟数据，`eastmoney` 使用真实 A 股快照。
         """
         items = self.watchlist.list_stocks()
         data_source = settings.data_source.strip().lower()
@@ -308,19 +310,9 @@ class AlertAgent(BaseAgent):
                 "message": "暂无自选股，未执行盘中扫描。",
             }
 
-        if data_source != "mock":
-            return {
-                "data_source": data_source,
-                "scanned": len(items),
-                "triggered": 0,
-                "deliverable": 0,
-                "alerts": [],
-                "message": f"当前数据源 {data_source} 暂未接入盘中扫描。",
-            }
-
         alerts: list[dict[str, Any]] = []
         for item in items:
-            signal = self._build_mock_signal(item)
+            signal = self._build_signal(item, data_source)
             if signal is None:
                 continue
 
@@ -362,6 +354,17 @@ class AlertAgent(BaseAgent):
 
     # ── 内部方法 ─────────────────────────────────────────
 
+    def _build_signal(
+        self,
+        item: WatchlistItem,
+        data_source: str,
+    ) -> Optional[dict[str, Any]]:
+        if data_source == "mock":
+            return self._build_mock_signal(item)
+        if data_source == "eastmoney":
+            return self._build_realtime_signal(item)
+        return None
+
     @staticmethod
     def _build_mock_signal(item: WatchlistItem) -> Optional[dict[str, Any]]:
         """基于 symbol 生成稳定的模拟预警信号。"""
@@ -391,6 +394,58 @@ class AlertAgent(BaseAgent):
             "strength": strength,
             "severity": severity,
         }
+
+    def _build_realtime_signal(self, item: WatchlistItem) -> Optional[dict[str, Any]]:
+        """基于实时 A 股快照生成最小预警。"""
+        if item.market != "a":
+            return None
+
+        try:
+            quote = self.market_data.get_quote(item.symbol, market="CN")
+        except MarketDataError as exc:
+            logger.warning("Failed to fetch realtime quote for %s: %s", item.symbol, exc)
+            return None
+
+        move_pct = abs(quote.change_pct)
+        name = item.name or quote.name or item.symbol
+
+        if move_pct >= 2.0:
+            direction = "放量拉升" if quote.change_pct > 0 else "快速回落"
+            return {
+                "alert_type": "price_spike",
+                "title": f"{name} {direction}",
+                "content": self._build_realtime_content(quote, direction),
+                "strength": round(min(10.0, 5.5 + move_pct), 1),
+                "severity": self._severity_for_move(move_pct),
+            }
+
+        if quote.amplitude_pct >= 4.0:
+            return {
+                "alert_type": "price_spike",
+                "title": f"{name} 振幅扩大",
+                "content": self._build_realtime_content(quote, "振幅扩大"),
+                "strength": round(min(10.0, 4.5 + quote.amplitude_pct / 2), 1),
+                "severity": AlertSeverity.INFO.value,
+            }
+
+        return None
+
+    @staticmethod
+    def _build_realtime_content(quote: QuoteSnapshot, direction: str) -> str:
+        return (
+            f"{quote.symbol} {quote.name} 触发{direction}预警，"
+            f"最新价 {quote.price:.2f}，涨跌幅 {quote.change_pct:+.2f}%，"
+            f"振幅 {quote.amplitude_pct:.2f}%，换手 {quote.turnover_rate:.2f}%，"
+            f"成交额 {quote.amount / 100000000:.2f} 亿。"
+        )
+
+    @staticmethod
+    def _severity_for_move(move_pct: float) -> str:
+        if move_pct >= 6.0:
+            return AlertSeverity.CRITICAL.value
+        if move_pct >= 3.5:
+            return AlertSeverity.WARNING.value
+        return AlertSeverity.INFO.value
 
     def _find_event(self, event_id: str) -> Optional[AlertEvent]:
         """按 event_id 查找事件"""

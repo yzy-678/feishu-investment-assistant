@@ -43,6 +43,8 @@ def mock_deps():
         patch("src.agents.report_agent.get_deepseek") as mock_ds,
         patch("src.agents.report_agent.get_watchlist") as mock_wl,
         patch("src.agents.report_agent.get_config") as mock_cfg,
+        patch("src.agents.report_agent.get_market_data_service") as mock_mds,
+        patch("src.agents.report_agent.settings.data_source", "eastmoney"),
     ):
         # DeepSeek mock
         ds = MagicMock()
@@ -59,8 +61,23 @@ def mock_deps():
         cfg.get_market.return_value = "CN"
         mock_cfg.return_value = cfg
 
+        mds = MagicMock()
+        mds.build_market_snapshot_text.return_value = (
+            "【实时 A 股快照】\n"
+            "数据时间（Asia/Shanghai）：2026-06-22 09:30:00\n"
+            "主要指数：\n"
+            "  - 上证指数 3400.00 (+0.80%, +27.00)"
+        )
+        mock_mds.return_value = mds
+
         agent = ReportAgent()
-        yield {"agent": agent, "deepseek": ds, "watchlist": wl, "config": cfg}
+        yield {
+            "agent": agent,
+            "deepseek": ds,
+            "watchlist": wl,
+            "config": cfg,
+            "market_data": mds,
+        }
 
 
 # ═══════════════════════════════════════════════════════════
@@ -123,6 +140,7 @@ class TestPromptBuilding:
     def test_prompt_includes_market(self, mock_deps):
         prompt = mock_deps["agent"]._build_report_prompt(ReportType.MORNING)
         assert "CN" in prompt
+        assert "Asia/Shanghai" in prompt
 
     def test_prompt_includes_report_type(self, mock_deps):
         morning = mock_deps["agent"]._build_report_prompt(ReportType.MORNING)
@@ -137,6 +155,7 @@ class TestPromptBuilding:
         sections = ["市场概览", "热点板块", "风险提示", "自选股观察", "操作关注点"]
         for section in sections:
             assert section in prompt
+        assert "实时 A 股快照" in prompt
 
     def test_prompt_includes_watchlist(self, mock_deps):
         items = [make_item("000001", "平安银行", tags="银行")]
