@@ -63,7 +63,28 @@ class AgentCoordinator:
             )
 
         with self._lock:
-            self._agents.append(agent)
+            if agent in self._agents:
+                logger.debug(
+                    "Agent already registered: %s (%s)",
+                    agent.__class__.__name__,
+                    agent.agent_type.value,
+                )
+                return
+
+            if agent.agent_type == AgentType.GENERAL:
+                self._agents.append(agent)
+            else:
+                general_index = next(
+                    (
+                        i for i, registered in enumerate(self._agents)
+                        if registered.agent_type == AgentType.GENERAL
+                    ),
+                    None,
+                )
+                if general_index is None:
+                    self._agents.append(agent)
+                else:
+                    self._agents.insert(general_index, agent)
 
         logger.info(
             "Registered agent: %s (%s)",

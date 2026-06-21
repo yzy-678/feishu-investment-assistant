@@ -20,6 +20,8 @@ class AgentType(str, Enum):
     """报告生成 Agent"""
     ALERT = "alert"
     """实时预警 Agent"""
+    GENERAL = "general"
+    """通用聊天 Agent"""
 
 
 class AgentResponse(BaseModel):

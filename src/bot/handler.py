@@ -19,6 +19,7 @@ from src.config.manager import ConfigManager, get_config
 from src.watchlist.manager import WatchlistError, WatchlistManager, get_watchlist
 from src.agents.base import BaseAgent
 from src.agents.coordinator import AgentCoordinator, get_coordinator
+from src.agents.general_agent import get_general_agent
 from src.agents.market_agent import get_market_agent
 from src.agents.report_agent import get_report_agent
 
@@ -62,6 +63,7 @@ class MessageHandler:
             get_market_agent(),
             get_report_agent(),
             self.alert_agent,
+            get_general_agent(),
         ]
 
         for agent in agents:
