@@ -13,10 +13,14 @@ import re
 from typing import Optional
 
 from src.ai.deepseek import DeepSeekError
+from src.agents.alert_agent import AlertAgent, get_alert_agent
 from src.bot.client import FeishuClient, FeishuError, get_feishu_client
 from src.config.manager import ConfigManager, get_config
 from src.watchlist.manager import WatchlistError, WatchlistManager, get_watchlist
+from src.agents.base import BaseAgent
 from src.agents.coordinator import AgentCoordinator, get_coordinator
+from src.agents.market_agent import get_market_agent
+from src.agents.report_agent import get_report_agent
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +46,32 @@ class MessageHandler:
         self.coordinator: AgentCoordinator = get_coordinator()
         self.config: ConfigManager = get_config()
         self.watchlist: WatchlistManager = get_watchlist()
+        self.alert_agent: AlertAgent = get_alert_agent()
+        self._register_agents()
         logger.info("MessageHandler initialized")
+
+    # ── Agent 注册 ────────────────────────────────────────
+
+    def _register_agents(self) -> None:
+        """注册所有 Agent 到 Coordinator
+
+        确保各 Agent 的 can_handle() 能被 Coordinator 依次检查，
+        匹配到第一个能处理的消息后交由对应 Agent 处理。
+        """
+        agents: list[BaseAgent] = [
+            get_market_agent(),
+            get_report_agent(),
+            self.alert_agent,
+        ]
+
+        for agent in agents:
+            self.coordinator.register(agent)
+
+        logger.info(
+            "Registered %d agents: %s",
+            len(agents),
+            [a.__class__.__name__ for a in agents],
+        )
 
     # ── 事件入口 ─────────────────────────────────────────
 
@@ -178,7 +207,38 @@ class MessageHandler:
             except ValueError as exc:
                 return f"❌ 设置失败: {exc}"
 
+        if text in ("立即扫描", "执行扫描", "扫描预警", "盘中扫描"):
+            return self._handle_manual_scan()
+
         return None  # 不是系统命令
+
+    def _handle_manual_scan(self) -> str:
+        """手动触发一次盘中预警扫描。"""
+        result = self.alert_agent.scan_watchlist()
+        alerts = result.get("alerts", [])
+        deliverable = [item for item in alerts if item.get("should_send")]
+
+        lines = [
+            "📡 盘中扫描完成",
+            f"数据源: {result['data_source']}",
+            f"扫描标的: {result['scanned']}",
+            f"触发预警: {result['triggered']}",
+            f"可推送预警: {result['deliverable']}",
+        ]
+
+        if deliverable:
+            for item in deliverable[:5]:
+                event = item["event"]
+                lines.append(
+                    f"- {event.related_code or event.title}: {event.title}（强度 {event.strength:.1f}）"
+                )
+            self.alert_agent.mark_delivered(
+                [item["event"].event_id for item in deliverable]
+            )
+        else:
+            lines.append(result["message"])
+
+        return "\n".join(lines)
 
     # ── 自选股管理 ───────────────────────────────────────
 

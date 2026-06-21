@@ -34,7 +34,17 @@ def mock_deps():
         patch("src.bot.handler.get_coordinator") as mock_c,
         patch("src.bot.handler.get_config") as mock_cfg,
         patch("src.bot.handler.get_watchlist") as mock_wl,
+        patch("src.bot.handler.get_market_agent") as mock_market_agent,
+        patch("src.bot.handler.get_report_agent") as mock_report_agent,
+        patch("src.bot.handler.get_alert_agent") as mock_alert_agent,
     ):
+        market_agent = MagicMock()
+        report_agent = MagicMock()
+        alert_agent = MagicMock()
+        mock_market_agent.return_value = market_agent
+        mock_report_agent.return_value = report_agent
+        mock_alert_agent.return_value = alert_agent
+
         handler = MessageHandler()
 
         yield {
@@ -43,6 +53,9 @@ def mock_deps():
             "coordinator": handler.coordinator,
             "config": handler.config,
             "watchlist": handler.watchlist,
+            "alert_agent": handler.alert_agent,
+            "market_agent": market_agent,
+            "report_agent": report_agent,
             "mock_feishu_get": mock_f,
             "mock_coordinator_get": mock_c,
             "mock_config_get": mock_cfg,
@@ -126,6 +139,32 @@ class TestSystemCommands:
         mock_deps["config"].set_scan_interval.side_effect = ValueError("至少60秒")
         reply = mock_deps["handler"].process_message("ou_x", "om_x", "扫描频率 30")
         assert "失败" in reply
+
+    def test_manual_scan_command(self, mock_deps):
+        """手动扫描命令"""
+        mock_event = MagicMock()
+        mock_event.related_code = "000001"
+        mock_event.title = "平安银行 放量拉升"
+        mock_event.strength = 8.1
+        mock_event.event_id = "price_spike:000001"
+        mock_deps["alert_agent"].scan_watchlist.return_value = {
+            "data_source": "mock",
+            "scanned": 3,
+            "triggered": 1,
+            "deliverable": 1,
+            "message": "扫描完成，发现 1 条可推送预警。",
+            "alerts": [
+                {"event": mock_event, "should_send": True, "reason": "new_event"},
+            ],
+        }
+
+        reply = mock_deps["handler"].process_message("ou_x", "om_x", "立即扫描")
+
+        assert "盘中扫描完成" in reply
+        assert "000001" in reply
+        mock_deps["alert_agent"].mark_delivered.assert_called_once_with(
+            ["price_spike:000001"]
+        )
 
 
 # ═══════════════════════════════════════════════════════════

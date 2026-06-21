@@ -5,6 +5,8 @@
 所有配置项均可通过环境变量覆盖。
 """
 
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
 
 
@@ -54,7 +56,7 @@ class Settings(BaseSettings):
     """行情数据源：mock / eastmoney / yahoo"""
 
     model_config = {
-        "env_file": ".env",
+        "env_file": str(Path(__file__).resolve().parent.parent.parent / ".env"),
         "env_file_encoding": "utf-8",
         "extra": "ignore",
     }

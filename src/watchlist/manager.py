@@ -6,6 +6,7 @@
 """
 
 import logging
+import sqlite3
 import threading
 from datetime import datetime
 from typing import Optional
@@ -52,12 +53,21 @@ class WatchlistManager:
         self._initialized = True
         logger.info("WatchlistManager initialized")
 
+    def _get_connection(self) -> sqlite3.Connection:
+        """获取当前有效的数据库连接。
+
+        测试和部分部署入口会重置 DatabaseManager 单例；这里每次刷新引用，
+        避免 WatchlistManager 长期持有已经失效的数据库路径。
+        """
+        self._db = get_database()
+        return self._db.get_connection()
+
     # ── Schema 迁移 ───────────────────────────────────────
 
     def _ensure_schema(self) -> None:
         """确保 watchlist 表包含 updated_at 列"""
         try:
-            conn = self._db.get_connection()
+            conn = self._get_connection()
             conn.execute("ALTER TABLE watchlist ADD COLUMN updated_at TIMESTAMP")
             conn.commit()
             logger.info("Added 'updated_at' column to watchlist table")
@@ -110,7 +120,7 @@ class WatchlistManager:
         now = datetime.now()
 
         try:
-            conn = self._db.get_connection()
+            conn = self._get_connection()
             cursor = conn.execute(
                 """INSERT INTO watchlist (symbol, name, market, tags, notes, added_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -134,7 +144,7 @@ class WatchlistManager:
         """
         symbol = symbol.upper()
         try:
-            conn = self._db.get_connection()
+            conn = self._get_connection()
             cursor = conn.execute(
                 "DELETE FROM watchlist WHERE symbol = ?", (symbol,)
             )
@@ -155,7 +165,7 @@ class WatchlistManager:
         """
         symbol = symbol.upper()
         try:
-            conn = self._db.get_connection()
+            conn = self._get_connection()
             row = conn.execute(
                 "SELECT * FROM watchlist WHERE symbol = ?", (symbol,)
             ).fetchone()
@@ -174,7 +184,7 @@ class WatchlistManager:
             WatchlistItem 列表（按添加时间倒序）
         """
         try:
-            conn = self._db.get_connection()
+            conn = self._get_connection()
             if market is not None:
                 market_key = market.upper()
                 if market_key not in ("CN", "HK", "US"):
@@ -226,7 +236,7 @@ class WatchlistManager:
             raise WatchlistError(f"自选股不存在: {symbol}")
 
         try:
-            conn = self._db.get_connection()
+            conn = self._get_connection()
             now = datetime.now()
             conn.execute(
                 f"UPDATE watchlist SET {field} = ?, updated_at = ? WHERE symbol = ?",
@@ -251,7 +261,7 @@ class WatchlistManager:
             匹配的自选股列表（按添加时间倒序）
         """
         try:
-            conn = self._db.get_connection()
+            conn = self._get_connection()
             rows = conn.execute(
                 "SELECT * FROM watchlist WHERE tags LIKE ? ORDER BY added_at DESC",
                 (f"%{tag}%",),
@@ -264,7 +274,7 @@ class WatchlistManager:
     def count(self) -> int:
         """统计自选股数量"""
         try:
-            conn = self._db.get_connection()
+            conn = self._get_connection()
             row = conn.execute("SELECT COUNT(*) as cnt FROM watchlist").fetchone()
             return row["cnt"]
         except Exception as exc:
@@ -278,7 +288,7 @@ class WatchlistManager:
             被删除的记录数
         """
         try:
-            conn = self._db.get_connection()
+            conn = self._get_connection()
             cursor = conn.execute("DELETE FROM watchlist")
             conn.commit()
             count = cursor.rowcount

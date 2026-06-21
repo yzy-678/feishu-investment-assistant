@@ -7,13 +7,15 @@
 
 import logging
 import threading
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import datetime
+import hashlib
+from typing import Any, Optional
 
 from src.agents.base import BaseAgent, AgentType, AgentResponse
 from src.config.manager import get_config
+from src.config.settings import settings
 from src.db import get_database
-from src.db.models import AlertEvent, AlertSeverity
+from src.db.models import AlertEvent, AlertSeverity, WatchlistItem
 from src.watchlist.manager import get_watchlist
 
 logger = logging.getLogger(__name__)
@@ -287,7 +289,108 @@ class AlertAgent(BaseAgent):
             logger.error("Failed to get active events: %s", exc)
             raise
 
+    def scan_watchlist(self) -> dict[str, Any]:
+        """执行一次最小可用的预警扫描。
+
+        当前仅为 `mock` 数据源生成稳定的模拟预警信号，
+        其余数据源先返回明确的未接入说明，便于后续接真行情。
+        """
+        items = self.watchlist.list_stocks()
+        data_source = settings.data_source.strip().lower()
+
+        if not items:
+            return {
+                "data_source": data_source,
+                "scanned": 0,
+                "triggered": 0,
+                "deliverable": 0,
+                "alerts": [],
+                "message": "暂无自选股，未执行盘中扫描。",
+            }
+
+        if data_source != "mock":
+            return {
+                "data_source": data_source,
+                "scanned": len(items),
+                "triggered": 0,
+                "deliverable": 0,
+                "alerts": [],
+                "message": f"当前数据源 {data_source} 暂未接入盘中扫描。",
+            }
+
+        alerts: list[dict[str, Any]] = []
+        for item in items:
+            signal = self._build_mock_signal(item)
+            if signal is None:
+                continue
+
+            event_id = self.make_event_id(signal["alert_type"], item.symbol)
+            event = self.record_event(
+                event_id=event_id,
+                alert_type=signal["alert_type"],
+                title=signal["title"],
+                content=signal["content"],
+                strength=signal["strength"],
+                severity=signal["severity"],
+                related_code=item.symbol,
+            )
+            should_send, reason = self.should_alert(event_id)
+            alerts.append({
+                "event": event,
+                "should_send": should_send,
+                "reason": reason,
+            })
+
+        deliverable = [a for a in alerts if a["should_send"]]
+        message = "未发现新的盘中预警。" if not deliverable else (
+            f"扫描完成，发现 {len(deliverable)} 条可推送预警。"
+        )
+
+        return {
+            "data_source": data_source,
+            "scanned": len(items),
+            "triggered": len(alerts),
+            "deliverable": len(deliverable),
+            "alerts": alerts,
+            "message": message,
+        }
+
+    def mark_delivered(self, event_ids: list[str]) -> None:
+        """批量标记已送达的预警事件。"""
+        for event_id in event_ids:
+            self.mark_sent(event_id)
+
     # ── 内部方法 ─────────────────────────────────────────
+
+    @staticmethod
+    def _build_mock_signal(item: WatchlistItem) -> Optional[dict[str, Any]]:
+        """基于 symbol 生成稳定的模拟预警信号。"""
+        digest = hashlib.md5(item.symbol.encode("utf-8")).hexdigest()
+        score = int(digest[:8], 16) % 100
+        if score < 65:
+            return None
+
+        direction = "放量拉升" if score % 2 == 0 else "快速回落"
+        strength = round(6.0 + (score - 65) / 10.0, 1)
+
+        if strength >= 8.5:
+            severity = AlertSeverity.CRITICAL.value
+        elif strength >= 7.2:
+            severity = AlertSeverity.WARNING.value
+        else:
+            severity = AlertSeverity.INFO.value
+
+        name = item.name or item.symbol
+        return {
+            "alert_type": "price_spike",
+            "title": f"{name} {direction}",
+            "content": (
+                f"{item.symbol} {name} 在 mock 行情源中触发盘中异动，"
+                f"当前强度 {strength:.1f}，请关注短线波动。"
+            ),
+            "strength": strength,
+            "severity": severity,
+        }
 
     def _find_event(self, event_id: str) -> Optional[AlertEvent]:
         """按 event_id 查找事件"""

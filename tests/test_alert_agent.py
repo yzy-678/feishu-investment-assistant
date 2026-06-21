@@ -17,7 +17,7 @@ from src.agents.alert_agent import (
     COOLDOWN_MINUTES, STRENGTH_ESCALATION_RATIO,
 )
 from src.agents.base import AgentType
-from src.db.models import AlertEvent, AlertSeverity
+from src.db.models import AlertEvent, AlertSeverity, WatchlistItem
 
 
 # ---- Fixtures ----------------------------------------------------------------
@@ -435,6 +435,60 @@ class TestLifecycle:
         e2 = agent._find_event("e2")
         assert e1.sent_count == 1
         assert e2.resolved == 1
+
+
+class TestScanning:
+
+    def test_scan_watchlist_empty(self, agent, monkeypatch):
+        monkeypatch.setattr("src.agents.alert_agent.settings.data_source", "mock")
+        with patch.object(agent.watchlist, "list_stocks", return_value=[]):
+            result = agent.scan_watchlist()
+
+        assert result["scanned"] == 0
+        assert result["deliverable"] == 0
+        assert "暂无自选股" in result["message"]
+
+    def test_scan_watchlist_non_mock(self, agent, monkeypatch):
+        monkeypatch.setattr("src.agents.alert_agent.settings.data_source", "eastmoney")
+        with patch.object(agent.watchlist, "list_stocks", return_value=[
+            WatchlistItem(
+                id=1, symbol="000001", name="平安银行", market="a",
+                tags="", notes="", added_at=datetime.now(),
+            )
+        ]):
+            result = agent.scan_watchlist()
+
+        assert result["scanned"] == 1
+        assert result["triggered"] == 0
+        assert "暂未接入盘中扫描" in result["message"]
+
+    def test_scan_watchlist_generates_deliverable_alert(self, agent, monkeypatch):
+        monkeypatch.setattr("src.agents.alert_agent.settings.data_source", "mock")
+        with (
+            patch.object(agent.watchlist, "list_stocks", return_value=[
+                WatchlistItem(
+                    id=1, symbol="000001", name="平安银行", market="a",
+                    tags="", notes="", added_at=datetime.now(),
+                )
+            ]),
+            patch.object(
+                AlertAgent,
+                "_build_mock_signal",
+                return_value={
+                    "alert_type": "price_spike",
+                    "title": "平安银行 放量拉升",
+                    "content": "mock content",
+                    "strength": 8.3,
+                    "severity": "warning",
+                },
+            ),
+        ):
+            result = agent.scan_watchlist()
+
+        assert result["scanned"] == 1
+        assert result["triggered"] == 1
+        assert result["deliverable"] == 1
+        assert result["alerts"][0]["should_send"] is True
 
 
 # ---- Singleton tests ---------------------------------------------------------
