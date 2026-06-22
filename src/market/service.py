@@ -307,9 +307,9 @@ class MarketDataService:
                         follow_redirects=True,
                     ) as client:
                         request = client.build_request("GET", path, params=params)
-                        logger.info("EastMoney request URL: %s", request.url)
-                        logger.info("EastMoney request headers: %s", dict(request.headers))
-                        logger.info(
+                        logger.debug("EastMoney request URL: %s", request.url)
+                        logger.debug("EastMoney request headers: %s", dict(request.headers))
+                        logger.debug(
                             "EastMoney request host attempt: %s (%d/%d)",
                             current_base_url,
                             attempt,
@@ -317,13 +317,13 @@ class MarketDataService:
                         )
 
                         response = client.send(request)
-                        logger.info("EastMoney response status: %s", response.status_code)
-                        logger.info(
+                        logger.debug("EastMoney response status: %s", response.status_code)
+                        logger.debug(
                             "EastMoney response location: %s",
                             response.headers.get("location", ""),
                         )
                         if response.history:
-                            logger.info(
+                            logger.debug(
                                 "EastMoney redirect history: %s",
                                 [
                                     {
@@ -334,7 +334,7 @@ class MarketDataService:
                                     for item in response.history
                                 ],
                             )
-                        logger.info(
+                        logger.debug(
                             "EastMoney response preview: %s",
                             response.text[:500],
                         )
@@ -346,8 +346,19 @@ class MarketDataService:
                                 response=response,
                             )
                             if attempt < MAX_ATTEMPTS_PER_HOST:
+                                logger.warning(
+                                    "EastMoney transient status: host=%s status=%d attempt=%d",
+                                    current_base_url,
+                                    response.status_code,
+                                    attempt,
+                                )
                                 time.sleep(0.2 * attempt)
                                 continue
+                            logger.warning(
+                                "EastMoney endpoint exhausted: host=%s status=%d",
+                                current_base_url,
+                                response.status_code,
+                            )
                             break
 
                         response.raise_for_status()

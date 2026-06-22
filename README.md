@@ -85,6 +85,9 @@ pytest tests/ -v
 3. 配置环境变量
 4. 部署完成
 
+生产环境变量、飞书回调和故障排查清单见：
+[`docs/railway_runbook.md`](docs/railway_runbook.md)
+
 ### GitHub Actions 定时任务
 
 配置以下 Secrets：
