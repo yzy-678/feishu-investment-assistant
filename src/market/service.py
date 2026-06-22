@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence, Union
 
 import httpx
 
@@ -20,7 +21,18 @@ logger = logging.getLogger(__name__)
 
 EASTMONEY_BASE_URL = "https://push2.eastmoney.com"
 EASTMONEY_HIS_BASE_URL = "https://push2his.eastmoney.com"
+EASTMONEY_QUOTE_BASE_URLS: tuple[str, ...] = (
+    "https://push2delay.eastmoney.com",
+    EASTMONEY_BASE_URL,
+)
+EASTMONEY_HIS_BASE_URLS: tuple[str, ...] = (
+    EASTMONEY_HIS_BASE_URL,
+    "https://81.push2his.eastmoney.com",
+    "https://82.push2his.eastmoney.com",
+)
 DEFAULT_TIMEOUT = 8.0
+RETRY_STATUS_CODES = {502, 503, 504}
+MAX_ATTEMPTS_PER_HOST = 2
 
 CN_INDEX_SECIDS: tuple[tuple[str, str], ...] = (
     ("1.000001", "上证指数"),
@@ -91,7 +103,7 @@ class MarketDataService:
 
         secid = self._to_secid(symbol)
         payload = self._request_json(
-            EASTMONEY_BASE_URL,
+            EASTMONEY_QUOTE_BASE_URLS,
             "/api/qt/stock/get",
             params={
                 "secid": secid,
@@ -116,7 +128,7 @@ class MarketDataService:
         quotes: list[QuoteSnapshot] = []
         for secid, fallback_name in CN_INDEX_SECIDS:
             payload = self._request_json(
-                EASTMONEY_BASE_URL,
+                EASTMONEY_QUOTE_BASE_URLS,
                 "/api/qt/stock/get",
                 params={
                     "secid": secid,
@@ -146,19 +158,23 @@ class MarketDataService:
         if not self.supports_market(market):
             raise MarketDataError(f"当前仅支持 A 股日线数据，收到市场: {market}")
 
-        payload = self._request_json(
-            EASTMONEY_HIS_BASE_URL,
-            "/api/qt/stock/kline/get",
-            params={
-                "secid": self._to_secid(symbol),
-                "klt": "101",
-                "fqt": "1",
-                "lmt": str(limit),
-                "end": "20500101",
-                "fields1": "f1,f2,f3",
-                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-            },
-        )
+        try:
+            payload = self._request_json(
+                EASTMONEY_HIS_BASE_URLS,
+                "/api/qt/stock/kline/get",
+                params={
+                    "secid": self._to_secid(symbol),
+                    "klt": "101",
+                    "fqt": "1",
+                    "lmt": str(limit),
+                    "end": "20500101",
+                    "fields1": "f1,f2,f3",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                },
+            )
+        except MarketDataError as exc:
+            logger.warning("EastMoney recent bars unavailable for %s: %s", symbol, exc)
+            return []
         klines = (payload.get("data") or {}).get("klines") or []
         bars: list[DailyBar] = []
         for line in klines:
@@ -262,37 +278,97 @@ class MarketDataService:
 
     def _request_json(
         self,
-        base_url: str,
+        base_url: Union[str, Sequence[str]],
         path: str,
         params: dict[str, str],
     ) -> dict:
         headers = {
-            "User-Agent": "Mozilla/5.0",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/137.0.0.0 Safari/537.36"
+            ),
             "Referer": "https://quote.eastmoney.com/",
+            "Origin": "https://quote.eastmoney.com",
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
 
-        try:
-            with httpx.Client(
-                base_url=base_url,
-                timeout=self.timeout,
-                headers=headers,
-            ) as client:
-                request = client.build_request("GET", path, params=params)
-                logger.info("EastMoney request URL: %s", request.url)
-                logger.info("EastMoney request headers: %s", dict(request.headers))
+        base_urls = (base_url,) if isinstance(base_url, str) else tuple(base_url)
+        last_exc: Optional[Exception] = None
 
-                response = client.send(request)
-                logger.info("EastMoney response status: %s", response.status_code)
-                logger.info(
-                    "EastMoney response preview: %s",
-                    response.text[:500],
-                )
+        for current_base_url in base_urls:
+            for attempt in range(1, MAX_ATTEMPTS_PER_HOST + 1):
+                try:
+                    with httpx.Client(
+                        base_url=current_base_url,
+                        timeout=self.timeout,
+                        headers=headers,
+                        follow_redirects=True,
+                    ) as client:
+                        request = client.build_request("GET", path, params=params)
+                        logger.info("EastMoney request URL: %s", request.url)
+                        logger.info("EastMoney request headers: %s", dict(request.headers))
+                        logger.info(
+                            "EastMoney request host attempt: %s (%d/%d)",
+                            current_base_url,
+                            attempt,
+                            MAX_ATTEMPTS_PER_HOST,
+                        )
 
-                response.raise_for_status()
-                return response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            logger.exception("EastMoney request failed: %s", exc)
-            raise MarketDataError(str(exc)) from exc
+                        response = client.send(request)
+                        logger.info("EastMoney response status: %s", response.status_code)
+                        logger.info(
+                            "EastMoney response location: %s",
+                            response.headers.get("location", ""),
+                        )
+                        if response.history:
+                            logger.info(
+                                "EastMoney redirect history: %s",
+                                [
+                                    {
+                                        "status": item.status_code,
+                                        "url": str(item.url),
+                                        "location": item.headers.get("location", ""),
+                                    }
+                                    for item in response.history
+                                ],
+                            )
+                        logger.info(
+                            "EastMoney response preview: %s",
+                            response.text[:500],
+                        )
+
+                        if response.status_code in RETRY_STATUS_CODES:
+                            last_exc = httpx.HTTPStatusError(
+                                f"EastMoney {response.status_code}",
+                                request=response.request,
+                                response=response,
+                            )
+                            if attempt < MAX_ATTEMPTS_PER_HOST:
+                                time.sleep(0.2 * attempt)
+                                continue
+                            break
+
+                        response.raise_for_status()
+                        return response.json()
+
+                except (httpx.HTTPError, ValueError) as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "EastMoney request failed: host=%s attempt=%d error=%s",
+                        current_base_url,
+                        attempt,
+                        exc,
+                    )
+                    if attempt < MAX_ATTEMPTS_PER_HOST:
+                        time.sleep(0.2 * attempt)
+                        continue
+                    break
+
+        raise MarketDataError(
+            f"EastMoney all endpoints failed: {last_exc}"
+        ) from last_exc
 
     @staticmethod
     def _to_secid(symbol: str) -> str:
