@@ -63,6 +63,8 @@ class QuoteSnapshot:
     amplitude_pct: float
     turnover_rate: float
     fetched_at: str
+    source: str = "EastMoney"
+    timestamp: str = ""
 
 
 @dataclass(frozen=True)
@@ -391,6 +393,7 @@ class MarketDataService:
 
     @staticmethod
     def _parse_quote(data: dict) -> QuoteSnapshot:
+        fetched_at = shanghai_now().strftime("%Y-%m-%d %H:%M:%S")
         return QuoteSnapshot(
             symbol=str(data.get("f57", "")),
             name=str(data.get("f58", "")),
@@ -405,7 +408,9 @@ class MarketDataService:
             amount=MarketDataService._to_float(data.get("f48")),
             amplitude_pct=MarketDataService._scaled_pct(data.get("f171")),
             turnover_rate=MarketDataService._scaled_pct(data.get("f168")),
-            fetched_at=shanghai_now().strftime("%Y-%m-%d %H:%M:%S"),
+            fetched_at=fetched_at,
+            source="EastMoney",
+            timestamp=fetched_at,
         )
 
     @staticmethod

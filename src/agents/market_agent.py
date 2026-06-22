@@ -6,7 +6,7 @@
 """
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from src.agents.base import BaseAgent, AgentType, AgentResponse
 from src.ai.deepseek import DeepSeekClient, DeepSeekError, get_deepseek
@@ -35,6 +35,15 @@ _HANDLE_KEYWORDS: list[str] = [
     # 自选
     "自选股", "我的自选",
 ]
+
+UNRELIABLE_QUOTE_MESSAGE = "未获取到可靠实时行情"
+
+REALTIME_QUOTE_RULES = """
+行情硬规则：
+- 你不得编造任何价格、涨跌幅、成交额、时间。
+- 你只能引用【实时行情】中提供的行情数字。
+- 如果【实时行情】显示“未获取到可靠实时行情”，不得分析今日走势、当前强弱或盘中表现。
+""".strip()
 
 
 class MarketAgent(BaseAgent):
@@ -84,7 +93,7 @@ class MarketAgent(BaseAgent):
         """
         try:
             # 1. 注入增强上下文
-            market_context = self._build_market_context(message)
+            market_context, reply_quote_block = self._build_market_context_parts(message)
             self.memory.add_message(
                 session_id,
                 "system",
@@ -94,6 +103,8 @@ class MarketAgent(BaseAgent):
 
             # 2. 带记忆的 AI 调用
             response = self.deepseek.chat_with_memory(session_id, message)
+            if reply_quote_block:
+                response = f"{reply_quote_block}\n\n{response}"
 
             logger.info(
                 "MarketAgent handled: session=%s, msg=%.40s, reply=%d chars",
@@ -136,17 +147,12 @@ class MarketAgent(BaseAgent):
             DeepSeekError: API 调用失败
         """
         market = self.config.get_market()
-        data_context = self._build_stock_data_context(symbol, market)
+        data_context, quote_valid, _ = self._build_stock_context(symbol, market)
+        analysis_points = self._build_stock_analysis_points(quote_valid)
         prompt = (
             f"你是一个专业的股票分析师。请分析股票 {symbol}（市场: {market}）。\\n\\n"
             f"{data_context}\\n\\n"
-            f"分析要点：\\n"
-            f"1. 公司基本概况（主营业务、行业地位）\\n"
-            f"2. 近期股价走势与成交量情况\\n"
-            f"3. 关键财务指标（营收、利润、估值）\\n"
-            f"4. 行业竞争格局与公司竞争优势\\n"
-            f"5. 主要风险因素\\n"
-            f"6. 综合投资建议\\n\\n"
+            f"{analysis_points}\\n\\n"
             f"{self._build_data_note(market)}"
         )
         return self.deepseek.chat([
@@ -225,6 +231,11 @@ class MarketAgent(BaseAgent):
     # ── 内部方法 ─────────────────────────────────────────
 
     def _build_market_context(self, message: str = "") -> str:
+        """构建增强上下文文本。"""
+        context, _ = self._build_market_context_parts(message)
+        return context
+
+    def _build_market_context_parts(self, message: str = "") -> tuple[str, str]:
         """构建增强上下文文本
 
         包含当前市场配置和用户自选股信息，
@@ -249,13 +260,21 @@ class MarketAgent(BaseAgent):
             logger.warning("Failed to load watchlist for market context")
             parts.append("\\n(自选股信息暂不可用)")
 
+        focus_symbol = self._extract_focus_symbol(message, items)
+        reply_quote_block = ""
+
         parts.append(self._build_realtime_context(
             market=market,
             watchlist_items=items,
-            focus_symbol=self._extract_focus_symbol(message, items),
         ))
 
-        return "\n".join(parts)
+        if focus_symbol:
+            stock_context, _, reply_quote_block = self._build_stock_context(
+                focus_symbol, market
+            )
+            parts.append(stock_context)
+
+        return "\n".join(parts), reply_quote_block
 
     def _build_realtime_context(
         self,
@@ -277,27 +296,59 @@ class MarketAgent(BaseAgent):
             return f"【实时行情】暂不可用：{exc}"
 
     def _build_stock_data_context(self, symbol: str, market: str) -> str:
-        if settings.data_source.strip().lower() != "eastmoney":
-            return "【行情来源】当前仍在使用 mock 数据源。"
+        context, _, _ = self._build_stock_context(symbol, market)
+        return context
 
+    def _build_stock_context(self, symbol: str, market: str) -> tuple[str, bool, str]:
+        if settings.data_source.strip().lower() != "eastmoney":
+            block = self._build_invalid_quote_block()
+            return (
+                "\n".join([
+                    block,
+                    "行情状态：当前仍在使用 mock 数据源。",
+                    REALTIME_QUOTE_RULES,
+                ]),
+                False,
+                block,
+            )
+
+        quote = None
         try:
             quote = self.market_data.get_quote(symbol, market=market)
-            bars = self.market_data.get_recent_bars(symbol, market=market, limit=5)
-            lines = [
-                "【实时个股数据】",
-                f"- {self.market_data.format_quote_detail(quote)}",
-            ]
-            if bars:
-                lines.append("【最近 5 个交易日】")
-                for bar in bars:
-                    lines.append(
-                        f"- {bar.trade_date} 收 {bar.close_price:.2f} "
-                        f"({bar.change_pct:+.2f}%) 振幅 {bar.amplitude_pct:.2f}%"
-                    )
-            return "\n".join(lines)
         except MarketDataError as exc:
             logger.warning("Failed to build stock data context for %s: %s", symbol, exc)
-            return f"【实时个股数据】{symbol} 行情暂不可用：{exc}"
+            self._log_quote_state(symbol, None, quote_valid=False)
+            block = self._build_invalid_quote_block()
+            return (
+                "\n".join([
+                    block,
+                    f"行情状态：{symbol} 行情暂不可用：{exc}",
+                    REALTIME_QUOTE_RULES,
+                    "分析范围：仅可分析基本面、行业逻辑和风险因素。",
+                ]),
+                False,
+                block,
+            )
+
+        quote_valid = self._is_quote_valid(quote)
+        self._log_quote_state(symbol, quote, quote_valid=quote_valid)
+        block = self._build_quote_block(quote, quote_valid)
+
+        lines = [block, REALTIME_QUOTE_RULES]
+
+        if not quote_valid:
+            lines.append("分析范围：仅可分析基本面、行业逻辑和风险因素。")
+            return "\n".join(lines), False, block
+
+        bars = self.market_data.get_recent_bars(symbol, market=market, limit=5)
+        if bars:
+            lines.append("【最近 5 个交易日】")
+            for bar in bars:
+                lines.append(
+                    f"- {bar.trade_date} 收 {bar.close_price:.2f} "
+                    f"({bar.change_pct:+.2f}%) 振幅 {bar.amplitude_pct:.2f}%"
+                )
+        return "\n".join(lines), True, block
 
     def _build_watchlist_snapshot(self, items, market: str) -> str:
         return self._build_realtime_context(market=market, watchlist_items=items)
@@ -305,8 +356,127 @@ class MarketAgent(BaseAgent):
     @staticmethod
     def _build_data_note(market: str) -> str:
         if settings.data_source.strip().lower() == "eastmoney" and market == "CN":
-            return "注意：请严格基于以上实时 A 股数据分析，仅供参考，不构成投资建议。"
+            return (
+                "注意：请严格基于以上代码提供的实时 A 股数据分析，"
+                "不得自行生成行情数字，仅供参考，不构成投资建议。"
+            )
         return "注意：当前仍为模拟/降级数据，仅供参考。"
+
+    @staticmethod
+    def _build_stock_analysis_points(quote_valid: bool) -> str:
+        if quote_valid:
+            return (
+                "分析要点：\n"
+                "1. 先给结论\n"
+                "2. 基于【实时行情】解读当前交易状态\n"
+                "3. 公司基本概况（主营业务、行业地位）\n"
+                "4. 行业竞争格局与公司竞争优势\n"
+                "5. 业绩、估值、预期差和催化因素\n"
+                "6. 主要风险因素"
+            )
+        return (
+            "分析要点：\n"
+            "1. 先说明未获取到可靠实时行情\n"
+            "2. 公司基本面（主营业务、行业地位、业绩逻辑）\n"
+            "3. 行业逻辑、政策方向和未来预期\n"
+            "4. 主要风险因素\n"
+            "禁止分析今日走势、当前强弱或盘中表现。"
+        )
+
+    def _is_quote_valid(self, quote: Any) -> bool:
+        return all(
+            self._quote_field_present(quote, field)
+            for field in ("price", "change_pct", "timestamp", "source")
+        )
+
+    def _build_quote_block(self, quote: Any, quote_valid: bool) -> str:
+        if not quote_valid:
+            return self._build_invalid_quote_block()
+
+        source = self._quote_value(quote, "source")
+        timestamp = self._quote_value(quote, "timestamp")
+        price = self._quote_value(quote, "price")
+        change_pct = self._quote_value(quote, "change_pct")
+        amount = self._quote_value(quote, "amount")
+
+        return "\n".join([
+            "【实时行情】",
+            f"数据来源：{source}",
+            f"数据时间：{timestamp}",
+            f"当前价：{self._format_price(price)}",
+            f"涨跌幅：{self._format_pct(change_pct)}",
+            f"成交额：{self._format_amount(amount)}",
+        ])
+
+    @staticmethod
+    def _build_invalid_quote_block() -> str:
+        return "\n".join([
+            "【实时行情】",
+            f"数据来源：{UNRELIABLE_QUOTE_MESSAGE}",
+            f"数据时间：{UNRELIABLE_QUOTE_MESSAGE}",
+            f"当前价：{UNRELIABLE_QUOTE_MESSAGE}",
+            f"涨跌幅：{UNRELIABLE_QUOTE_MESSAGE}",
+            f"成交额：{UNRELIABLE_QUOTE_MESSAGE}",
+        ])
+
+    def _quote_field_present(self, quote: Any, field: str) -> bool:
+        value = self._quote_value(quote, field)
+        return value not in (None, "")
+
+    @staticmethod
+    def _quote_value(quote: Any, field: str) -> Any:
+        if quote is None:
+            return None
+
+        candidates = [field]
+        if field == "timestamp":
+            candidates.append("fetched_at")
+
+        for candidate in candidates:
+            if isinstance(quote, dict) and candidate in quote:
+                value = quote.get(candidate)
+                if value not in (None, ""):
+                    return value
+                continue
+            if hasattr(quote, candidate):
+                value = getattr(quote, candidate)
+                if value not in (None, ""):
+                    return value
+        return None
+
+    @staticmethod
+    def _format_price(value: Any) -> str:
+        try:
+            return f"{float(value):.2f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    @staticmethod
+    def _format_pct(value: Any) -> str:
+        try:
+            return f"{float(value):+.2f}%"
+        except (TypeError, ValueError):
+            return str(value)
+
+    @staticmethod
+    def _format_amount(value: Any) -> str:
+        if value in (None, ""):
+            return "未提供"
+        try:
+            return f"{float(value) / 100000000:.2f} 亿"
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _log_quote_state(self, symbol: str, quote: Any, quote_valid: bool) -> None:
+        logger.info(
+            "MarketAgent quote state: symbol=%s source=%s timestamp=%s price=%s change_pct=%s quote_valid=%s",
+            symbol,
+            self._quote_value(quote, "source"),
+            self._quote_value(quote, "timestamp"),
+            self._quote_value(quote, "price"),
+            self._quote_value(quote, "change_pct"),
+            quote_valid,
+        )
 
     def _extract_focus_symbol(self, message: str, items=None) -> str:
         symbol = self.market_data.extract_symbol(message)

@@ -8,6 +8,7 @@ Prompt 注入、异常处理、边界条件、并发。
 """
 
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
 
 import pytest
@@ -18,6 +19,7 @@ from src.ai.deepseek import DeepSeekError
 from src.ai.prompts import INVESTMENT_ASSISTANT_SYSTEM_PROMPT
 from src.watchlist.manager import WatchlistError
 from src.db.models import WatchlistItem
+from src.market import QuoteSnapshot
 
 
 # ── 辅助: 创建测试用自选股 ─────────────────────────────
@@ -88,7 +90,24 @@ def mock_deps():
         mock_mds_instance.format_quote_detail.return_value = (
             "000001 平安银行 10.52 (-2.41%)"
         )
-        mock_mds_instance.get_quote.return_value = MagicMock()
+        mock_mds_instance.get_quote.return_value = QuoteSnapshot(
+            symbol="000001",
+            name="平安银行",
+            price=10.52,
+            change=-0.05,
+            change_pct=-0.48,
+            open_price=10.55,
+            high_price=10.60,
+            low_price=10.50,
+            prev_close=10.57,
+            volume=100000,
+            amount=98000000,
+            amplitude_pct=0.95,
+            turnover_rate=0.42,
+            fetched_at="2026-06-22 10:00:00",
+            source="EastMoney",
+            timestamp="2026-06-22 10:00:00",
+        )
         mock_mds_instance.get_recent_bars.return_value = [
             MagicMock(trade_date="2026-06-18", close_price=10.52, change_pct=-2.41, amplitude_pct=2.32)
         ]
@@ -202,6 +221,21 @@ class TestHandle:
         resp = mock_deps["agent"].handle("session1", long_msg)
         assert resp.success is True
 
+    def test_handle_prefixes_code_generated_quote_block(self, mock_deps):
+        """个股分析回复应前置代码生成的实时行情块"""
+        mock_deps["market_data"].extract_symbol.return_value = "000001"
+        mock_deps["deepseek"].chat_with_memory.return_value = "AI 只负责解读"
+
+        resp = mock_deps["agent"].handle("session1", "分析 000001")
+
+        assert resp.message.startswith("【实时行情】")
+        assert "数据来源：EastMoney" in resp.message
+        assert "数据时间：2026-06-22 10:00:00" in resp.message
+        assert "当前价：10.52" in resp.message
+        assert "涨跌幅：-0.48%" in resp.message
+        assert "成交额：0.98 亿" in resp.message
+        assert "AI 只负责解读" in resp.message
+
 
 # ═══════════════════════════════════════════════════════════
 #  analyze_stock 测试
@@ -223,7 +257,51 @@ class TestAnalyzeStock:
         assert INVESTMENT_ASSISTANT_SYSTEM_PROMPT in messages[0]["content"]
         prompt = messages[1]["content"]
         assert "000001" in prompt
-        assert "实时个股数据" in prompt
+        assert "【实时行情】" in prompt
+        assert "数据来源：EastMoney" in prompt
+
+    @pytest.mark.parametrize(
+        "quote",
+        [
+            SimpleNamespace(
+                symbol="000001",
+                name="平安银行",
+                change_pct=-0.48,
+                amount=98000000,
+                timestamp="2026-06-22 10:00:00",
+                source="EastMoney",
+            ),
+            SimpleNamespace(
+                symbol="000001",
+                name="平安银行",
+                price=10.52,
+                change_pct=-0.48,
+                amount=98000000,
+                source="EastMoney",
+            ),
+            SimpleNamespace(
+                symbol="000001",
+                name="平安银行",
+                price=10.52,
+                change_pct=-0.48,
+                amount=98000000,
+                timestamp="2026-06-22 10:00:00",
+            ),
+        ],
+    )
+    def test_invalid_quote_disables_realtime_judgment(self, mock_deps, quote):
+        """缺失关键行情字段时，不允许模型分析实时盘面。"""
+        mock_deps["market_data"].get_quote.return_value = quote
+        mock_deps["deepseek"].chat.return_value = "基本面分析"
+
+        mock_deps["agent"].analyze_stock("000001")
+
+        messages = mock_deps["deepseek"].chat.call_args[0][0]
+        prompt = messages[1]["content"]
+        assert "未获取到可靠实时行情" in prompt
+        assert "禁止分析今日走势、当前强弱或盘中表现" in prompt
+        assert "近期股价走势" not in prompt
+        assert "基于【实时行情】解读当前交易状态" not in prompt
 
     def test_analyze_stock_deepseek_error(self, mock_deps):
         """DeepSeek 异常应向上传递"""
@@ -240,6 +318,20 @@ class TestAnalyzeStock:
         messages = mock_deps["deepseek"].chat.call_args[0][0]
         prompt = messages[1]["content"]
         assert "HK" in prompt or "00700" in prompt
+
+    def test_quote_state_logged(self, mock_deps, caplog):
+        """日志应记录行情校验关键字段"""
+        caplog.set_level("INFO", logger="src.agents.market_agent")
+
+        mock_deps["agent"].analyze_stock("000001")
+
+        logs = "\n".join(record.getMessage() for record in caplog.records)
+        assert "symbol=000001" in logs
+        assert "source=EastMoney" in logs
+        assert "timestamp=2026-06-22 10:00:00" in logs
+        assert "price=10.52" in logs
+        assert "change_pct=-0.48" in logs
+        assert "quote_valid=True" in logs
 
 
 # ═══════════════════════════════════════════════════════════
