@@ -266,19 +266,32 @@ class MarketDataService:
         path: str,
         params: dict[str, str],
     ) -> dict:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://quote.eastmoney.com/",
+        }
+
         try:
             with httpx.Client(
                 base_url=base_url,
                 timeout=self.timeout,
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Referer": "https://quote.eastmoney.com/",
-                },
+                headers=headers,
             ) as client:
-                response = client.get(path, params=params)
+                request = client.build_request("GET", path, params=params)
+                logger.info("EastMoney request URL: %s", request.url)
+                logger.info("EastMoney request headers: %s", dict(request.headers))
+
+                response = client.send(request)
+                logger.info("EastMoney response status: %s", response.status_code)
+                logger.info(
+                    "EastMoney response preview: %s",
+                    response.text[:500],
+                )
+
                 response.raise_for_status()
                 return response.json()
         except (httpx.HTTPError, ValueError) as exc:
+            logger.exception("EastMoney request failed: %s", exc)
             raise MarketDataError(str(exc)) from exc
 
     @staticmethod
