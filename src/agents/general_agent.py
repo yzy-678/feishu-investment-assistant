@@ -9,6 +9,8 @@ from typing import Optional
 
 from src.agents.base import BaseAgent, AgentResponse, AgentType
 from src.ai.deepseek import DeepSeekClient, get_deepseek
+from src.ai.prompts import INVESTMENT_ASSISTANT_SYSTEM_PROMPT
+from src.memory import ConversationMemory, get_memory
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,7 @@ class GeneralAgent(BaseAgent):
         if getattr(self, "_initialized", False):
             return
         self.deepseek: DeepSeekClient = get_deepseek()
+        self.memory: ConversationMemory = get_memory()
         self._initialized = True
         logger.info("GeneralAgent initialized")
 
@@ -40,6 +43,11 @@ class GeneralAgent(BaseAgent):
 
     def handle(self, session_id: str, message: str) -> AgentResponse:
         try:
+            self.memory.add_message(
+                session_id,
+                "system",
+                INVESTMENT_ASSISTANT_SYSTEM_PROMPT,
+            )
             reply = self.deepseek.chat_with_memory(session_id, message)
             return AgentResponse(
                 success=True,

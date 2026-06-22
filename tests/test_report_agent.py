@@ -14,6 +14,7 @@ from src.agents.report_agent import (
     ReportAgent, ReportType, get_report_agent,
 )
 from src.ai.deepseek import DeepSeekError
+from src.ai.prompts import INVESTMENT_ASSISTANT_SYSTEM_PROMPT
 from src.db.models import WatchlistItem
 
 
@@ -194,19 +195,24 @@ class TestGenerateReport:
     def test_generate_morning(self, mock_deps):
         result = mock_deps["agent"].generate_morning_report()
         assert result == "这是生成的报告内容"
-        prompt = mock_deps["deepseek"].chat.call_args[0][0][0]["content"]
+        messages = mock_deps["deepseek"].chat.call_args[0][0]
+        assert messages[0]["role"] == "system"
+        assert INVESTMENT_ASSISTANT_SYSTEM_PROMPT in messages[0]["content"]
+        prompt = messages[1]["content"]
         assert "早报" in prompt
 
     def test_generate_noon(self, mock_deps):
         result = mock_deps["agent"].generate_noon_report()
         assert result == "这是生成的报告内容"
-        prompt = mock_deps["deepseek"].chat.call_args[0][0][0]["content"]
+        messages = mock_deps["deepseek"].chat.call_args[0][0]
+        prompt = messages[1]["content"]
         assert "午间观察" in prompt
 
     def test_generate_closing(self, mock_deps):
         result = mock_deps["agent"].generate_closing_report()
         assert result == "这是生成的报告内容"
-        prompt = mock_deps["deepseek"].chat.call_args[0][0][0]["content"]
+        messages = mock_deps["deepseek"].chat.call_args[0][0]
+        prompt = messages[1]["content"]
         assert "收盘复盘" in prompt
 
     def test_generate_via_enum(self, mock_deps):
@@ -222,12 +228,15 @@ class TestGenerateReport:
     def test_generate_passes_correct_prompt(self, mock_deps):
         mock_deps["agent"].generate_report(ReportType.MORNING)
         messages = mock_deps["deepseek"].chat.call_args[0][0]
-        assert len(messages) == 1
-        assert messages[0]["role"] == "user"
+        assert len(messages) == 2
+        assert messages[0]["role"] == "system"
+        assert INVESTMENT_ASSISTANT_SYSTEM_PROMPT in messages[0]["content"]
+        assert messages[1]["role"] == "user"
 
     def test_generate_noon_timeframe_in_prompt(self, mock_deps):
         mock_deps["agent"].generate_noon_report()
-        prompt = mock_deps["deepseek"].chat.call_args[0][0][0]["content"]
+        messages = mock_deps["deepseek"].chat.call_args[0][0]
+        prompt = messages[1]["content"]
         assert "午间" in prompt
 
 

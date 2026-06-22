@@ -15,6 +15,7 @@ import pytest
 from src.agents.base import AgentType, AgentResponse
 from src.agents.market_agent import MarketAgent, get_market_agent
 from src.ai.deepseek import DeepSeekError
+from src.ai.prompts import INVESTMENT_ASSISTANT_SYSTEM_PROMPT
 from src.watchlist.manager import WatchlistError
 from src.db.models import WatchlistItem
 
@@ -158,9 +159,10 @@ class TestHandle:
         mock_deps["agent"].handle("session1", "分析大盘")
         calls = mock_deps["memory"].add_message.call_args_list
         system_calls = [c for c in calls if c[0][1] == "system"]
-        assert len(system_calls) >= 1
-        ctx_text = system_calls[0][0][2]
-        assert "当前市场: CN" in ctx_text or "当前关注市场: CN" in ctx_text
+        assert len(system_calls) >= 2
+        system_text = "\n".join(c[0][2] for c in system_calls)
+        assert INVESTMENT_ASSISTANT_SYSTEM_PROMPT in system_text
+        assert "当前关注市场: CN" in system_text
 
     def test_handle_injects_watchlist_context(self, mock_deps):
         """有自选股时应注入自选股信息"""
@@ -173,7 +175,7 @@ class TestHandle:
         mock_deps["agent"].handle("session1", "分析大盘")
         calls = mock_deps["memory"].add_message.call_args_list
         system_calls = [c for c in calls if c[0][1] == "system"]
-        ctx_text = system_calls[0][0][2]
+        ctx_text = "\n".join(c[0][2] for c in system_calls)
         assert "平安银行" in ctx_text
         assert "贵州茅台" in ctx_text
 
@@ -216,7 +218,10 @@ class TestAnalyzeStock:
         assert result == "平安银行分析结果"
         mock_deps["deepseek"].chat.assert_called_once()
         # 验证 prompt 中包含股票代码
-        prompt = mock_deps["deepseek"].chat.call_args[0][0][0]["content"]
+        messages = mock_deps["deepseek"].chat.call_args[0][0]
+        assert messages[0]["role"] == "system"
+        assert INVESTMENT_ASSISTANT_SYSTEM_PROMPT in messages[0]["content"]
+        prompt = messages[1]["content"]
         assert "000001" in prompt
         assert "实时个股数据" in prompt
 
@@ -232,7 +237,8 @@ class TestAnalyzeStock:
         mock_deps["deepseek"].chat.return_value = "港股分析结果"
         result = mock_deps["agent"].analyze_stock("00700")
         assert result == "港股分析结果"
-        prompt = mock_deps["deepseek"].chat.call_args[0][0][0]["content"]
+        messages = mock_deps["deepseek"].chat.call_args[0][0]
+        prompt = messages[1]["content"]
         assert "HK" in prompt or "00700" in prompt
 
 
@@ -256,7 +262,10 @@ class TestAnalyzeWatchlist:
         result = mock_deps["agent"].analyze_watchlist()
         assert result == "组合分析结果"
 
-        prompt = mock_deps["deepseek"].chat.call_args[0][0][0]["content"]
+        messages = mock_deps["deepseek"].chat.call_args[0][0]
+        assert messages[0]["role"] == "system"
+        assert INVESTMENT_ASSISTANT_SYSTEM_PROMPT in messages[0]["content"]
+        prompt = messages[1]["content"]
         assert "平安银行" in prompt
         assert "贵州茅台" in prompt
         assert "银行" in prompt  # 标签信息应包含
@@ -290,7 +299,10 @@ class TestMarketOverview:
         mock_deps["deepseek"].chat.return_value = "A股概况"
         result = mock_deps["agent"].market_overview()
         assert result == "A股概况"
-        prompt = mock_deps["deepseek"].chat.call_args[0][0][0]["content"]
+        messages = mock_deps["deepseek"].chat.call_args[0][0]
+        assert messages[0]["role"] == "system"
+        assert INVESTMENT_ASSISTANT_SYSTEM_PROMPT in messages[0]["content"]
+        prompt = messages[1]["content"]
         assert "CN" in prompt or "A" in prompt
         assert "实时 A 股快照" in prompt
 

@@ -8,6 +8,7 @@ from src.agents.base import AgentResponse, AgentType, BaseAgent
 from src.agents.coordinator import AgentCoordinator
 from src.agents.general_agent import GeneralAgent
 from src.ai.deepseek import DeepSeekError
+from src.ai.prompts import INVESTMENT_ASSISTANT_SYSTEM_PROMPT
 
 
 @pytest.fixture(autouse=True)
@@ -17,16 +18,31 @@ def reset_singleton():
 
 
 @pytest.fixture
-def mock_deepseek():
-    with patch("src.agents.general_agent.get_deepseek") as mocked_get:
+def mock_deps():
+    with (
+        patch("src.agents.general_agent.get_deepseek") as mocked_get,
+        patch("src.agents.general_agent.get_memory") as mocked_memory,
+    ):
         client = MagicMock()
         client.chat_with_memory.return_value = "通用回复"
         mocked_get.return_value = client
-        yield client
+        memory = MagicMock()
+        mocked_memory.return_value = memory
+        yield {"deepseek": client, "memory": memory}
 
 
 @pytest.fixture
-def agent(mock_deepseek):
+def mock_deepseek(mock_deps):
+    return mock_deps["deepseek"]
+
+
+@pytest.fixture
+def mock_memory(mock_deps):
+    return mock_deps["memory"]
+
+
+@pytest.fixture
+def agent(mock_deps):
     return GeneralAgent()
 
 
@@ -95,6 +111,15 @@ class TestGeneralAgent:
         assert resp.message == "通用回复"
         assert resp.metadata == {"type": "general_chat"}
         mock_deepseek.chat_with_memory.assert_called_once_with("ou_x", "你好")
+
+    def test_handle_injects_system_prompt(self, agent, mock_memory):
+        agent.handle("ou_x", "你好")
+
+        mock_memory.add_message.assert_called_once_with(
+            "ou_x",
+            "system",
+            INVESTMENT_ASSISTANT_SYSTEM_PROMPT,
+        )
 
     def test_session_id_passed_to_deepseek(self, agent, mock_deepseek):
         agent.handle("session_123", "你是谁")

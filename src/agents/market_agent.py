@@ -10,6 +10,7 @@ from typing import Optional
 
 from src.agents.base import BaseAgent, AgentType, AgentResponse
 from src.ai.deepseek import DeepSeekClient, DeepSeekError, get_deepseek
+from src.ai.prompts import INVESTMENT_ASSISTANT_SYSTEM_PROMPT
 from src.config.manager import ConfigManager, get_config
 from src.config.settings import settings
 from src.market import MarketDataError, get_market_data_service
@@ -84,6 +85,11 @@ class MarketAgent(BaseAgent):
         try:
             # 1. 注入增强上下文
             market_context = self._build_market_context(message)
+            self.memory.add_message(
+                session_id,
+                "system",
+                INVESTMENT_ASSISTANT_SYSTEM_PROMPT,
+            )
             self.memory.add_message(session_id, "system", market_context)
 
             # 2. 带记忆的 AI 调用
@@ -143,7 +149,10 @@ class MarketAgent(BaseAgent):
             f"6. 综合投资建议\\n\\n"
             f"{self._build_data_note(market)}"
         )
-        return self.deepseek.chat([{"role": "user", "content": prompt}])
+        return self.deepseek.chat([
+            {"role": "system", "content": INVESTMENT_ASSISTANT_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ])
 
     def analyze_watchlist(self) -> str:
         """分析当前自选股组合
@@ -179,7 +188,10 @@ class MarketAgent(BaseAgent):
             f"4. 调仓建议（需增配/减配的方向）\\n\\n"
             f"{self._build_data_note(market)}"
         )
-        return self.deepseek.chat([{"role": "user", "content": prompt}])
+        return self.deepseek.chat([
+            {"role": "system", "content": INVESTMENT_ASSISTANT_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ])
 
     def market_overview(self) -> str:
         """获取市场概况
@@ -205,7 +217,10 @@ class MarketAgent(BaseAgent):
             f"5. 明日关注要点\\n\\n"
             f"{self._build_data_note(market)}"
         )
-        return self.deepseek.chat([{"role": "user", "content": prompt}])
+        return self.deepseek.chat([
+            {"role": "system", "content": INVESTMENT_ASSISTANT_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ])
 
     # ── 内部方法 ─────────────────────────────────────────
 
@@ -217,7 +232,7 @@ class MarketAgent(BaseAgent):
         """
         market = self.config.get_market()
         parts: list[str] = [
-            f"你是一个专业的投资分析助手。当前关注市场: {market}。",
+            f"当前关注市场: {market}。",
         ]
         items = []
 

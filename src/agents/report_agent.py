@@ -11,6 +11,7 @@ from typing import Optional
 
 from src.agents.base import BaseAgent, AgentType, AgentResponse
 from src.ai.deepseek import DeepSeekError, get_deepseek
+from src.ai.prompts import INVESTMENT_ASSISTANT_SYSTEM_PROMPT
 from src.config.manager import get_config
 from src.config.settings import settings
 from src.market import MarketDataError, get_market_data_service
@@ -153,7 +154,10 @@ class ReportAgent(BaseAgent):
             DeepSeekError: API 调用失败
         """
         prompt = self._build_report_prompt(report_type)
-        return self.deepseek.chat([{"role": "user", "content": prompt}])
+        return self.deepseek.chat([
+            {"role": "system", "content": INVESTMENT_ASSISTANT_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ])
 
     # ── Prompt 构建 ──────────────────────────────────────
 
@@ -168,7 +172,7 @@ class ReportAgent(BaseAgent):
         data_note = self._build_data_note(market)
 
         prompt = (
-            f"你是一个专业的投资分析助手。请生成{report_type.display_name}（{report_type.timeframe}）。\n\n"
+            f"请生成{report_type.display_name}（{report_type.timeframe}）。\n\n"
             f"【基本信息】\n"
             f"日期：{today}\n"
             f"当前时间（Asia/Shanghai）：{now_text}\n"
