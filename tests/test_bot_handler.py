@@ -319,6 +319,40 @@ class TestEventParsing:
         result = mock_deps["handler"].handle_event(event)
         assert result is None  # 异常被吞掉
 
+    def test_duplicate_message_id_only_replied_once(self, mock_deps):
+        """同一条飞书消息重复投递时只回复一次"""
+        mock_deps["coordinator"].route.return_value = AgentResponse(
+            success=True, agent=AgentType.GENERAL, message="只回复一次",
+        )
+        event = make_text_event("你好", message_id="om_dup_1")
+
+        first = mock_deps["handler"].handle_event(event)
+        second = mock_deps["handler"].handle_event(event)
+
+        assert first == "只回复一次"
+        assert second is None
+        mock_deps["coordinator"].route.assert_called_once_with("ou_test", "你好")
+        mock_deps["feishu"].reply_text.assert_called_once()
+
+    def test_failed_message_can_retry(self, mock_deps):
+        """首次处理失败后，同一 message_id 后续仍可重试"""
+        mock_deps["coordinator"].route.return_value = AgentResponse(
+            success=True, agent=AgentType.GENERAL, message="重试成功",
+        )
+        mock_deps["feishu"].reply_text.side_effect = [
+            FeishuError("temporary error"),
+            None,
+        ]
+        event = make_text_event("你好", message_id="om_retry_1")
+
+        first = mock_deps["handler"].handle_event(event)
+        second = mock_deps["handler"].handle_event(event)
+
+        assert first is None
+        assert second == "重试成功"
+        assert mock_deps["coordinator"].route.call_count == 2
+        assert mock_deps["feishu"].reply_text.call_count == 2
+
 
 # ═══════════════════════════════════════════════════════════
 #  单例测试

@@ -12,7 +12,7 @@ import json
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, BackgroundTasks, Request
 
 from src.bot.handler import get_handler
 from src.config.manager import get_config
@@ -23,8 +23,19 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _run_handler_safely(raw: dict[str, Any]) -> None:
+    """后台执行 handler，并吞掉异常避免影响飞书回调确认。"""
+    try:
+        handler = get_handler()
+        handler.handle_event(raw)
+    except Exception as exc:
+        logger.warning("Handler error: %s", exc)
+
+
 @router.post("/feishu/event")
-async def feishu_event(request: Request) -> dict[str, Any]:
+async def feishu_event(
+    request: Request, background_tasks: BackgroundTasks
+) -> dict[str, Any]:
     """飞书事件回调入口
 
     处理两种请求：
@@ -52,11 +63,7 @@ async def feishu_event(request: Request) -> dict[str, Any]:
     logger.debug("Received Feishu event: %s", event_type)
 
     if event_type == "im.message.receive_v1":
-        try:
-            handler = get_handler()
-            handler.handle_event(raw)
-        except Exception as exc:
-            logger.warning("Handler error: %s", exc)
+        background_tasks.add_task(_run_handler_safely, raw)
 
     return {"code": 0, "msg": "ok"}
 
