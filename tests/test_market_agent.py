@@ -153,6 +153,9 @@ class TestCanHandle:
         assert not mock_deps["agent"].can_handle("")
         assert not mock_deps["agent"].can_handle("   ")
 
+    def test_can_handle_debug_quote(self, mock_deps):
+        assert mock_deps["agent"].can_handle("debug quote 300136")
+
     def test_agent_type(self, mock_deps):
         assert mock_deps["agent"].agent_type == AgentType.MARKET
 
@@ -235,6 +238,64 @@ class TestHandle:
         assert "涨跌幅：-0.48%" in resp.message
         assert "成交额：0.98 亿" in resp.message
         assert "AI 只负责解读" in resp.message
+
+    def test_admin_can_debug_quote_without_calling_deepseek(self, mock_deps):
+        with patch(
+            "src.agents.market_agent.settings.admin_user_open_id",
+            "ou_admin",
+        ):
+            resp = mock_deps["agent"].handle(
+                "ou_admin",
+                "debug quote 300136",
+            )
+
+        assert resp.success is True
+        assert "source: EastMoney" in resp.message
+        assert "timestamp: 2026-06-22 10:00:00" in resp.message
+        assert "price: 10.52" in resp.message
+        assert "change_pct: -0.48" in resp.message
+        assert "quote_valid: true" in resp.message
+        assert "missing_fields: []" in resp.message
+        mock_deps["market_data"].get_quote.assert_called_once_with(
+            "300136",
+            market="CN",
+        )
+        mock_deps["deepseek"].chat_with_memory.assert_not_called()
+
+    def test_non_admin_cannot_debug_quote(self, mock_deps):
+        with patch(
+            "src.agents.market_agent.settings.admin_user_open_id",
+            "ou_admin",
+        ):
+            resp = mock_deps["agent"].handle(
+                "ou_other",
+                "debug quote 300136",
+            )
+
+        assert resp.success is False
+        assert "无权" in resp.message
+        mock_deps["market_data"].get_quote.assert_not_called()
+        mock_deps["deepseek"].chat_with_memory.assert_not_called()
+
+    def test_debug_quote_reports_missing_fields(self, mock_deps):
+        mock_deps["market_data"].get_quote.return_value = SimpleNamespace(
+            symbol="300136",
+            source="EastMoney",
+            price=52.1,
+            change_pct=1.25,
+        )
+
+        with patch(
+            "src.agents.market_agent.settings.admin_user_open_id",
+            "ou_admin",
+        ):
+            resp = mock_deps["agent"].handle(
+                "ou_admin",
+                "debug quote 300136",
+            )
+
+        assert "quote_valid: false" in resp.message
+        assert "missing_fields: ['timestamp']" in resp.message
 
 
 # ═══════════════════════════════════════════════════════════
@@ -332,6 +393,21 @@ class TestAnalyzeStock:
         assert "price=10.52" in logs
         assert "change_pct=-0.48" in logs
         assert "quote_valid=True" in logs
+        assert "missing_fields=[]" in logs
+
+    def test_missing_quote_fields_logged(self, mock_deps, caplog):
+        caplog.set_level("INFO", logger="src.agents.market_agent")
+        mock_deps["market_data"].get_quote.return_value = SimpleNamespace(
+            symbol="000001",
+            price=10.52,
+            source="EastMoney",
+        )
+
+        mock_deps["agent"].analyze_stock("000001")
+
+        logs = "\n".join(record.getMessage() for record in caplog.records)
+        assert "quote_valid=False" in logs
+        assert "missing_fields=['change_pct', 'timestamp']" in logs
 
 
 # ═══════════════════════════════════════════════════════════

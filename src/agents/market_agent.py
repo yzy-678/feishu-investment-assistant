@@ -6,6 +6,7 @@
 """
 
 import logging
+import re
 from typing import Any, Optional
 
 from src.agents.base import BaseAgent, AgentType, AgentResponse
@@ -45,6 +46,8 @@ REALTIME_QUOTE_RULES = """
 - 如果【实时行情】显示“未获取到可靠实时行情”，不得分析今日走势、当前强弱或盘中表现。
 """.strip()
 
+DEBUG_QUOTE_PATTERN = re.compile(r"^debug\s+quote\s+(\d{6})$", re.IGNORECASE)
+
 
 class MarketAgent(BaseAgent):
     """市场问答 Agent
@@ -82,6 +85,8 @@ class MarketAgent(BaseAgent):
         if not message or not message.strip():
             return False
         msg = message.strip()
+        if DEBUG_QUOTE_PATTERN.fullmatch(msg):
+            return True
         return any(kw in msg for kw in _HANDLE_KEYWORDS)
 
     def handle(self, session_id: str, message: str) -> AgentResponse:
@@ -92,6 +97,13 @@ class MarketAgent(BaseAgent):
         3. 返回结果或异常包装
         """
         try:
+            debug_match = DEBUG_QUOTE_PATTERN.fullmatch(message.strip())
+            if debug_match:
+                return self._handle_debug_quote(
+                    session_id,
+                    debug_match.group(1),
+                )
+
             # 1. 注入增强上下文
             market_context, reply_quote_block = self._build_market_context_parts(message)
             self.memory.add_message(
@@ -384,10 +396,14 @@ class MarketAgent(BaseAgent):
         )
 
     def _is_quote_valid(self, quote: Any) -> bool:
-        return all(
-            self._quote_field_present(quote, field)
+        return not self._missing_quote_fields(quote)
+
+    def _missing_quote_fields(self, quote: Any) -> list[str]:
+        return [
+            field
             for field in ("price", "change_pct", "timestamp", "source")
-        )
+            if not self._quote_field_present(quote, field)
+        ]
 
     def _build_quote_block(self, quote: Any, quote_valid: bool) -> str:
         if not quote_valid:
@@ -468,14 +484,69 @@ class MarketAgent(BaseAgent):
             return str(value)
 
     def _log_quote_state(self, symbol: str, quote: Any, quote_valid: bool) -> None:
+        missing_fields = self._missing_quote_fields(quote)
         logger.info(
-            "MarketAgent quote state: symbol=%s source=%s timestamp=%s price=%s change_pct=%s quote_valid=%s",
+            "MarketAgent quote state: symbol=%s source=%s timestamp=%s price=%s "
+            "change_pct=%s quote_valid=%s missing_fields=%s",
             symbol,
             self._quote_value(quote, "source"),
             self._quote_value(quote, "timestamp"),
             self._quote_value(quote, "price"),
             self._quote_value(quote, "change_pct"),
             quote_valid,
+            missing_fields,
+        )
+
+    def _handle_debug_quote(self, session_id: str, symbol: str) -> AgentResponse:
+        admin_open_id = settings.admin_user_open_id.strip()
+        if not admin_open_id or session_id.strip() != admin_open_id:
+            logger.warning(
+                "Quote debug denied: session=%s symbol=%s",
+                session_id[:8],
+                symbol,
+            )
+            return AgentResponse(
+                success=False,
+                agent=AgentType.MARKET,
+                message="无权使用行情调试命令。",
+                metadata={"type": "quote_debug", "authorized": False},
+            )
+
+        quote = None
+        try:
+            quote = self.market_data.get_quote(symbol, market="CN")
+        except MarketDataError as exc:
+            logger.warning(
+                "Quote debug failed: symbol=%s reason=%s error=%s",
+                symbol,
+                getattr(exc, "reason", "unknown"),
+                exc,
+            )
+
+        missing_fields = self._missing_quote_fields(quote)
+        quote_valid = not missing_fields
+        self._log_quote_state(symbol, quote, quote_valid)
+        reply = "\n".join([
+            f"source: {self._quote_value(quote, 'source') or ''}",
+            f"timestamp: {self._quote_value(quote, 'timestamp') or ''}",
+            f"price: {self._quote_value(quote, 'price') if quote is not None else ''}",
+            (
+                "change_pct: "
+                f"{self._quote_value(quote, 'change_pct') if quote is not None else ''}"
+            ),
+            f"quote_valid: {str(quote_valid).lower()}",
+            f"missing_fields: {missing_fields}",
+        ])
+        return AgentResponse(
+            success=True,
+            agent=AgentType.MARKET,
+            message=reply,
+            metadata={
+                "type": "quote_debug",
+                "symbol": symbol,
+                "quote_valid": quote_valid,
+                "missing_fields": missing_fields,
+            },
         )
 
     def _extract_focus_symbol(self, message: str, items=None) -> str:

@@ -44,6 +44,10 @@ CN_INDEX_SECIDS: tuple[tuple[str, str], ...] = (
 class MarketDataError(Exception):
     """实时行情获取失败。"""
 
+    def __init__(self, message: str, reason: str = "unknown") -> None:
+        super().__init__(message)
+        self.reason = reason
+
 
 @dataclass(frozen=True)
 class QuoteSnapshot:
@@ -101,26 +105,69 @@ class MarketDataService:
     def get_quote(self, symbol: str, market: str = "CN") -> QuoteSnapshot:
         """获取单只 A 股实时快照。"""
         if not self.supports_market(market):
-            raise MarketDataError(f"当前仅支持 A 股实时行情，收到市场: {market}")
+            raise MarketDataError(
+                f"当前仅支持 A 股实时行情，收到市场: {market}",
+                reason="invalid_response",
+            )
 
-        secid = self._to_secid(symbol)
-        payload = self._request_json(
-            EASTMONEY_QUOTE_BASE_URLS,
-            "/api/qt/stock/get",
-            params={
-                "secid": secid,
-                "fields": ",".join(
-                    [
-                        "f57", "f58", "f43", "f44", "f45", "f46", "f47",
-                        "f48", "f60", "f168", "f169", "f170", "f171",
-                    ]
-                ),
-            },
-        )
+        try:
+            secid = self._to_secid(symbol)
+            payload = self._request_json(
+                EASTMONEY_QUOTE_BASE_URLS,
+                "/api/qt/stock/get",
+                params={
+                    "secid": secid,
+                    "fields": ",".join(
+                        [
+                            "f57", "f58", "f43", "f44", "f45", "f46", "f47",
+                            "f48", "f60", "f168", "f169", "f170", "f171",
+                        ]
+                    ),
+                },
+                symbol=symbol,
+            )
+        except MarketDataError as exc:
+            logger.warning(
+                "EastMoney quote failed: symbol=%s reason=%s error=%s",
+                symbol,
+                exc.reason,
+                exc,
+            )
+            raise
+
         data = payload.get("data") or {}
         if not data or not data.get("f57"):
-            raise MarketDataError(f"未获取到股票 {symbol} 的实时行情")
-        return self._parse_quote(data)
+            logger.warning(
+                "EastMoney quote failed: symbol=%s reason=symbol_not_found",
+                symbol,
+            )
+            raise MarketDataError(
+                f"未获取到股票 {symbol} 的实时行情",
+                reason="symbol_not_found",
+            )
+
+        try:
+            quote = self._parse_quote(data)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "EastMoney quote failed: symbol=%s reason=parse_error error=%s",
+                symbol,
+                exc,
+            )
+            raise MarketDataError(
+                f"股票 {symbol} 行情解析失败: {exc}",
+                reason="parse_error",
+            ) from exc
+
+        logger.info(
+            "EastMoney quote success: symbol=%s price=%s change_pct=%s timestamp=%s source=%s",
+            symbol,
+            quote.price,
+            quote.change_pct,
+            quote.timestamp,
+            quote.source,
+        )
+        return quote
 
     def get_index_quotes(self, market: str = "CN") -> list[QuoteSnapshot]:
         """获取主要指数快照。"""
@@ -283,6 +330,7 @@ class MarketDataService:
         base_url: Union[str, Sequence[str]],
         path: str,
         params: dict[str, str],
+        symbol: str = "",
     ) -> dict:
         headers = {
             "User-Agent": (
@@ -298,9 +346,11 @@ class MarketDataService:
 
         base_urls = (base_url,) if isinstance(base_url, str) else tuple(base_url)
         last_exc: Optional[Exception] = None
+        last_reason = "network_error"
 
         for current_base_url in base_urls:
             for attempt in range(1, MAX_ATTEMPTS_PER_HOST + 1):
+                started_at = time.perf_counter()
                 try:
                     with httpx.Client(
                         base_url=current_base_url,
@@ -309,7 +359,11 @@ class MarketDataService:
                         follow_redirects=True,
                     ) as client:
                         request = client.build_request("GET", path, params=params)
-                        logger.debug("EastMoney request URL: %s", request.url)
+                        logger.info(
+                            "EastMoney request: symbol=%s url=%s",
+                            symbol or "-",
+                            request.url,
+                        )
                         logger.debug("EastMoney request headers: %s", dict(request.headers))
                         logger.debug(
                             "EastMoney request host attempt: %s (%d/%d)",
@@ -319,7 +373,14 @@ class MarketDataService:
                         )
 
                         response = client.send(request)
-                        logger.debug("EastMoney response status: %s", response.status_code)
+                        elapsed_ms = (time.perf_counter() - started_at) * 1000
+                        logger.info(
+                            "EastMoney response: symbol=%s url=%s status=%s elapsed_ms=%.1f",
+                            symbol or "-",
+                            response.request.url,
+                            response.status_code,
+                            elapsed_ms,
+                        )
                         logger.debug(
                             "EastMoney response location: %s",
                             response.headers.get("location", ""),
@@ -342,6 +403,7 @@ class MarketDataService:
                         )
 
                         if response.status_code in RETRY_STATUS_CODES:
+                            last_reason = "invalid_response"
                             last_exc = httpx.HTTPStatusError(
                                 f"EastMoney {response.status_code}",
                                 request=response.request,
@@ -364,14 +426,71 @@ class MarketDataService:
                             break
 
                         response.raise_for_status()
-                        return response.json()
+                        try:
+                            return response.json()
+                        except ValueError as exc:
+                            last_exc = exc
+                            last_reason = "parse_error"
+                            logger.warning(
+                                "EastMoney request failed: symbol=%s reason=parse_error "
+                                "url=%s status=%s elapsed_ms=%.1f error=%s",
+                                symbol or "-",
+                                response.request.url,
+                                response.status_code,
+                                elapsed_ms,
+                                exc,
+                            )
+                            if attempt < MAX_ATTEMPTS_PER_HOST:
+                                time.sleep(0.2 * attempt)
+                                continue
+                            break
 
-                except (httpx.HTTPError, ValueError) as exc:
+                except httpx.TimeoutException as exc:
                     last_exc = exc
+                    last_reason = "timeout"
+                    elapsed_ms = (time.perf_counter() - started_at) * 1000
                     logger.warning(
-                        "EastMoney request failed: host=%s attempt=%d error=%s",
+                        "EastMoney request failed: symbol=%s reason=timeout "
+                        "host=%s attempt=%d elapsed_ms=%.1f error=%s",
+                        symbol or "-",
                         current_base_url,
                         attempt,
+                        elapsed_ms,
+                        exc,
+                    )
+                    if attempt < MAX_ATTEMPTS_PER_HOST:
+                        time.sleep(0.2 * attempt)
+                        continue
+                    break
+                except httpx.RequestError as exc:
+                    last_exc = exc
+                    last_reason = "network_error"
+                    elapsed_ms = (time.perf_counter() - started_at) * 1000
+                    logger.warning(
+                        "EastMoney request failed: symbol=%s reason=network_error "
+                        "host=%s attempt=%d elapsed_ms=%.1f error=%s",
+                        symbol or "-",
+                        current_base_url,
+                        attempt,
+                        elapsed_ms,
+                        exc,
+                    )
+                    if attempt < MAX_ATTEMPTS_PER_HOST:
+                        time.sleep(0.2 * attempt)
+                        continue
+                    break
+                except httpx.HTTPStatusError as exc:
+                    last_exc = exc
+                    last_reason = "invalid_response"
+                    elapsed_ms = (time.perf_counter() - started_at) * 1000
+                    logger.warning(
+                        "EastMoney request failed: symbol=%s reason=invalid_response "
+                        "host=%s status=%s attempt=%d elapsed_ms=%.1f error=%s",
+                        symbol or "-",
+                        current_base_url,
+                        exc.response.status_code,
+                        attempt,
+                        elapsed_ms,
                         exc,
                     )
                     if attempt < MAX_ATTEMPTS_PER_HOST:
@@ -380,14 +499,18 @@ class MarketDataService:
                     break
 
         raise MarketDataError(
-            f"EastMoney all endpoints failed: {last_exc}"
+            f"EastMoney all endpoints failed: {last_exc}",
+            reason=last_reason,
         ) from last_exc
 
     @staticmethod
     def _to_secid(symbol: str) -> str:
         normalized = symbol.strip()
         if not re.fullmatch(r"\d{6}", normalized):
-            raise MarketDataError(f"仅支持 6 位 A 股代码，收到: {symbol}")
+            raise MarketDataError(
+                f"仅支持 6 位 A 股代码，收到: {symbol}",
+                reason="symbol_not_found",
+            )
         market = "1" if normalized.startswith(("5", "6", "9")) else "0"
         return f"{market}.{normalized}"
 
