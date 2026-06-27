@@ -45,7 +45,7 @@ then save the Feishu callback settings again.
 
 ## Redeploy
 
-Use this after every push to `master`:
+Use this after every push to `main`:
 
 1. Open Railway project.
 2. Open service `feishu-investment-assistant`.
@@ -54,7 +54,7 @@ Use this after every push to `master`:
 5. Click `Redeploy`.
 6. Wait until the deployment status is `Active`.
 
-The current production branch is `master`.
+The current production branch is `main`.
 
 ## Smoke Test
 
