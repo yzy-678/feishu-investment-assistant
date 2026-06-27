@@ -10,7 +10,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Deploy to Railway
-        uses: railway/railway-action@v3
+      - uses: actions/setup-node@v4
         with:
-          railway_token: ${{ secrets.RAILWAY_TOKEN }}
+          node-version: "20"
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+      - name: Deploy to Railway
+        run: railway up --detach
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
