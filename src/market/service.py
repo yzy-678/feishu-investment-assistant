@@ -39,6 +39,7 @@ EASTMONEY_HIS_BASE_URLS: tuple[str, ...] = (
     "https://81.push2his.eastmoney.com",
     "https://82.push2his.eastmoney.com",
 )
+EASTMONEY_SEARCH_BASE_URL = "https://searchapi.eastmoney.com"
 DEFAULT_TIMEOUT = 8.0
 RETRY_STATUS_CODES = {502, 503, 504}
 MAX_ATTEMPTS_PER_HOST = 2
@@ -111,14 +112,40 @@ class MarketDataService:
     ) -> None:
         self.timeout = timeout
         self._akshare_source = akshare_source
+        self._symbol_search_cache: dict[str, Optional[str]] = {}
 
     def supports_market(self, market: str) -> bool:
         return market.strip().upper() == "CN"
 
     def extract_symbol(self, text: str) -> Optional[str]:
-        """从文本中提取 6 位 A 股代码。"""
+        """从文本中提取 A 股代码。
+
+        优先提取显式 6 位代码；没有代码时，使用 EastMoney 证券搜索把
+        股票简称解析为代码，避免股票问题落入通用 LLM 兜底。
+        """
         match = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
-        return match.group(1) if match else None
+        if match:
+            return match.group(1)
+
+        keyword = self._normalize_symbol_search_keyword(text)
+        if not keyword:
+            return None
+        if keyword in self._symbol_search_cache:
+            return self._symbol_search_cache[keyword]
+
+        try:
+            symbol = self._search_symbol_by_name(keyword)
+        except MarketDataError as exc:
+            logger.warning(
+                "EastMoney symbol search failed: keyword=%s reason=%s error=%s",
+                keyword,
+                exc.reason,
+                exc,
+            )
+            symbol = None
+
+        self._symbol_search_cache[keyword] = symbol
+        return symbol
 
     def get_quote(self, symbol: str, market: str = "CN") -> QuoteSnapshot:
         """获取单只 A 股实时快照。"""
@@ -192,6 +219,66 @@ class MarketDataService:
             quote.failure_reason,
         )
         return quote
+
+    def _search_symbol_by_name(self, keyword: str) -> Optional[str]:
+        payload = self._request_json(
+            EASTMONEY_SEARCH_BASE_URL,
+            "/api/suggest/get",
+            params={
+                "input": keyword,
+                "type": "14",
+                "count": "5",
+            },
+            symbol=keyword,
+        )
+        rows = (
+            payload.get("QuotationCodeTable", {}).get("Data", [])
+            if isinstance(payload, dict)
+            else []
+        )
+        if not isinstance(rows, list):
+            return None
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            code = str(row.get("Code") or row.get("UnifiedCode") or "").strip()
+            name = str(row.get("Name") or "").strip()
+            classify = str(row.get("Classify") or "").strip()
+            if (
+                re.fullmatch(r"\d{6}", code)
+                and classify == "AStock"
+                and (name == keyword or keyword in name or name in keyword)
+            ):
+                return code
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            code = str(row.get("Code") or row.get("UnifiedCode") or "").strip()
+            classify = str(row.get("Classify") or "").strip()
+            if re.fullmatch(r"\d{6}", code) and classify == "AStock":
+                return code
+        return None
+
+    @staticmethod
+    def _normalize_symbol_search_keyword(text: str) -> str:
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return ""
+        cleaned = re.sub(r"[？?！!。,.，、:：；;（）()【】\[\]{}<>《》]", " ", cleaned)
+        cleaned = re.sub(
+            r"(帮我|请|麻烦|查一下|查下|查询|看一下|看看|看下|分析|点评|"
+            r"怎么看|如何看|股票|个股|股价|行情|走势|今天|现在|一下|吗|呢)",
+            " ",
+            cleaned,
+        )
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if not cleaned or len(cleaned) > 12:
+            return ""
+        if not re.search(r"[\u4e00-\u9fff]{2,}", cleaned):
+            return ""
+        return cleaned
 
     def get_history(self, symbol: str, period: int = 60) -> list[HistoryBar]:
         """获取历史 K 线。数据源：AkShare。"""

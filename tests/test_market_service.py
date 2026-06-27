@@ -92,6 +92,44 @@ def test_quote_success_logs_request_response_and_fields(monkeypatch, caplog):
     assert quote.failure_reason == ""
 
 
+def test_extract_symbol_resolves_stock_name_with_eastmoney_search(monkeypatch):
+    seen_inputs = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_inputs.append(dict(request.url.params).get("input"))
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "QuotationCodeTable": {
+                    "Data": [
+                        {
+                            "Code": "600206",
+                            "Name": "有研新材",
+                            "Classify": "AStock",
+                        }
+                    ]
+                }
+            },
+        )
+
+    _install_transport(monkeypatch, handler)
+
+    service = MarketDataService()
+
+    assert service.extract_symbol("查一下有研新材") == "600206"
+    assert seen_inputs == ["有研新材"]
+
+
+def test_extract_symbol_prefers_explicit_code_without_search(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("explicit code should not call EastMoney search")
+
+    _install_transport(monkeypatch, handler)
+
+    assert MarketDataService().extract_symbol("分析 300136") == "300136"
+
+
 def test_quote_timeout_is_classified(monkeypatch, caplog):
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("request timed out", request=request)

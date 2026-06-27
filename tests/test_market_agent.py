@@ -199,6 +199,13 @@ class TestCanHandle:
     def test_can_handle_debug_quote(self, mock_deps):
         assert mock_deps["agent"].can_handle("debug quote 300136")
 
+    def test_can_handle_bare_stock_name_after_symbol_resolution(self, mock_deps):
+        mock_deps["market_data"].extract_symbol.return_value = "600206"
+
+        assert mock_deps["agent"].can_handle("有研新材")
+
+        mock_deps["market_data"].extract_symbol.assert_called_with("有研新材")
+
     @pytest.mark.parametrize("msg", [
         "信维通信今天有什么消息？",
         "商业航天为什么涨？",
@@ -692,6 +699,26 @@ class TestAnalyzeStock:
         assert resp.success is True
         assert resp.message == STOCK_DATA_FAILURE_MESSAGE
         assert resp.metadata["data_available"] is False
+        mock_deps["deepseek"].chat_with_memory.assert_not_called()
+
+    def test_handle_bare_stock_name_uses_market_gate_without_llm_on_failure(
+        self,
+        mock_deps,
+    ):
+        """裸股票名进入 MarketAgent 后，也必须执行实时数据硬门禁。"""
+        mock_deps["market_data"].extract_symbol.return_value = "600206"
+        mock_deps["market_data"].get_quote.side_effect = MarketDataError(
+            "timeout",
+            reason="timeout",
+        )
+
+        resp = mock_deps["agent"].handle("session1", "有研新材")
+
+        assert resp.message == STOCK_DATA_FAILURE_MESSAGE
+        mock_deps["market_data"].get_quote.assert_called_with(
+            "600206",
+            market="CN",
+        )
         mock_deps["deepseek"].chat_with_memory.assert_not_called()
 
 

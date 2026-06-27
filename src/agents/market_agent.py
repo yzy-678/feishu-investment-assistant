@@ -106,7 +106,11 @@ class MarketAgent(BaseAgent):
             return True
         if is_news_intent(msg):
             return False
-        return any(kw in msg for kw in _HANDLE_KEYWORDS)
+        if any(kw in msg for kw in _HANDLE_KEYWORDS):
+            return True
+        if self._looks_like_stock_name_query(msg):
+            return bool(self.market_data.extract_symbol(msg))
+        return False
 
     def handle(self, session_id: str, message: str) -> AgentResponse:
         """处理用户消息
@@ -1231,6 +1235,15 @@ class MarketAgent(BaseAgent):
             if item.name and item.name in message:
                 return item.symbol
         return ""
+
+    @staticmethod
+    def _looks_like_stock_name_query(message: str) -> bool:
+        cleaned = re.sub(r"\s+", "", str(message or "").strip())
+        if not cleaned or len(cleaned) > 12:
+            return False
+        if cleaned in {"你好", "您好", "谢谢", "早上好", "晚上好"}:
+            return False
+        return bool(re.search(r"[\u4e00-\u9fff]{2,}", cleaned))
 
 
 # ── 全局单例访问函数 ─────────────────────────────────────
