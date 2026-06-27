@@ -14,12 +14,23 @@ from unittest.mock import MagicMock, patch, call
 import pytest
 
 from src.agents.base import AgentType, AgentResponse
-from src.agents.market_agent import MarketAgent, get_market_agent
+from src.agents.market_agent import (
+    MarketAgent,
+    STOCK_DATA_FAILURE_MESSAGE,
+    get_market_agent,
+)
 from src.ai.deepseek import DeepSeekError
 from src.ai.prompts import INVESTMENT_ASSISTANT_SYSTEM_PROMPT
 from src.watchlist.manager import WatchlistError
 from src.db.models import WatchlistItem
-from src.market import HistoryBar, MACDSnapshot, MASnapshot, QuoteSnapshot, StockInfo
+from src.market import (
+    HistoryBar,
+    MACDSnapshot,
+    MASnapshot,
+    MarketDataError,
+    QuoteSnapshot,
+    StockInfo,
+)
 
 
 # ── 辅助: 创建测试用自选股 ─────────────────────────────
@@ -504,19 +515,35 @@ class TestAnalyzeStock:
             ),
         ],
     )
-    def test_invalid_quote_disables_realtime_judgment(self, mock_deps, quote):
-        """缺失关键行情字段时，不允许模型分析实时盘面。"""
+    def test_invalid_quote_stops_stock_analysis(self, mock_deps, quote):
+        """缺失关键行情字段时，必须直接失败，不允许模型继续分析。"""
         mock_deps["market_data"].get_quote.return_value = quote
         mock_deps["deepseek"].chat.return_value = "基本面分析"
 
-        mock_deps["agent"].analyze_stock("000001")
+        result = mock_deps["agent"].analyze_stock("000001")
 
-        messages = mock_deps["deepseek"].chat.call_args[0][0]
-        prompt = messages[1]["content"]
-        assert "未获取到可靠实时行情" in prompt
-        assert "禁止分析今日走势、当前强弱或盘中表现" in prompt
-        assert "近期股价走势" not in prompt
-        assert "基于【实时行情】解读当前交易状态" not in prompt
+        assert result == STOCK_DATA_FAILURE_MESSAGE
+        mock_deps["deepseek"].chat.assert_not_called()
+        mock_deps["market_data"].get_history.assert_not_called()
+        mock_deps["market_data"].get_ma.assert_not_called()
+        mock_deps["market_data"].get_macd.assert_not_called()
+        mock_deps["market_data"].get_stock_info.assert_not_called()
+
+    def test_quote_fetch_error_stops_stock_analysis(self, mock_deps):
+        """EastMoney 返回异常时，必须直接失败，不允许模型继续分析。"""
+        mock_deps["market_data"].get_quote.side_effect = MarketDataError(
+            "timeout",
+            reason="timeout",
+        )
+
+        result = mock_deps["agent"].analyze_stock("000001")
+
+        assert result == STOCK_DATA_FAILURE_MESSAGE
+        mock_deps["deepseek"].chat.assert_not_called()
+        mock_deps["market_data"].get_history.assert_not_called()
+        mock_deps["market_data"].get_ma.assert_not_called()
+        mock_deps["market_data"].get_macd.assert_not_called()
+        mock_deps["market_data"].get_stock_info.assert_not_called()
 
     def test_analyze_stock_deepseek_error(self, mock_deps):
         """DeepSeek 异常应向上传递"""
@@ -592,7 +619,7 @@ class TestAnalyzeStock:
         assert mock_deps["agent"]._is_quote_valid(quote) is False
         assert mock_deps["agent"]._missing_quote_fields(quote) == ["timestamp"]
 
-    def test_stale_quote_disables_realtime_judgment(self, mock_deps):
+    def test_stale_quote_stops_stock_analysis(self, mock_deps):
         quote = SimpleNamespace(
             symbol="000001",
             price=10.52,
@@ -605,12 +632,67 @@ class TestAnalyzeStock:
         )
         mock_deps["market_data"].get_quote.return_value = quote
 
-        mock_deps["agent"].analyze_stock("000001")
+        result = mock_deps["agent"].analyze_stock("000001")
 
-        messages = mock_deps["deepseek"].chat.call_args[0][0]
-        prompt = messages[1]["content"]
-        assert "未获取到可靠实时行情" in prompt
-        assert "禁止分析今日走势、当前强弱或盘中表现" in prompt
+        assert result == STOCK_DATA_FAILURE_MESSAGE
+        mock_deps["deepseek"].chat.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("history", []),
+            ("ma", MASnapshot(symbol="000001", MA5=10.8, MA10=None, MA20=10.5, MA60=10.2)),
+            ("macd", MACDSnapshot(symbol="000001", DIF=0.12, DEA=None, MACD=0.08)),
+            ("stock_info", StockInfo(symbol="000001", name="平安银行", industry="银行", concepts=[])),
+        ],
+    )
+    def test_akshare_empty_or_missing_data_stops_stock_analysis(
+        self,
+        mock_deps,
+        field,
+        value,
+    ):
+        """AkShare 任一数据为空或字段缺失时，必须直接失败，不允许模型继续分析。"""
+        if field == "history":
+            mock_deps["market_data"].get_history.return_value = value
+        elif field == "ma":
+            mock_deps["market_data"].get_ma.return_value = value
+        elif field == "macd":
+            mock_deps["market_data"].get_macd.return_value = value
+        elif field == "stock_info":
+            mock_deps["market_data"].get_stock_info.return_value = value
+
+        result = mock_deps["agent"].analyze_stock("000001")
+
+        assert result == STOCK_DATA_FAILURE_MESSAGE
+        mock_deps["deepseek"].chat.assert_not_called()
+
+    def test_akshare_exception_stops_stock_analysis(self, mock_deps):
+        """AkShare 超时/异常时，必须直接失败，不允许模型继续分析。"""
+        mock_deps["market_data"].get_macd.side_effect = TimeoutError("timeout")
+
+        result = mock_deps["agent"].analyze_stock("000001")
+
+        assert result == STOCK_DATA_FAILURE_MESSAGE
+        mock_deps["deepseek"].chat.assert_not_called()
+
+    def test_handle_stock_data_failure_returns_fixed_message_without_llm(
+        self,
+        mock_deps,
+    ):
+        """普通聊天入口遇到个股数据失败时，也必须直接返回固定文案。"""
+        mock_deps["market_data"].extract_symbol.return_value = "000001"
+        mock_deps["market_data"].get_quote.side_effect = MarketDataError(
+            "timeout",
+            reason="timeout",
+        )
+
+        resp = mock_deps["agent"].handle("session1", "分析 000001")
+
+        assert resp.success is True
+        assert resp.message == STOCK_DATA_FAILURE_MESSAGE
+        assert resp.metadata["data_available"] is False
+        mock_deps["deepseek"].chat_with_memory.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════

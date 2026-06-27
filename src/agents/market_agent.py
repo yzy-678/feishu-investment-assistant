@@ -44,6 +44,7 @@ _HANDLE_KEYWORDS: list[str] = [
 ]
 
 UNRELIABLE_QUOTE_MESSAGE = "未获取到可靠实时行情"
+STOCK_DATA_FAILURE_MESSAGE = "实时数据获取失败，暂时无法分析"
 
 REALTIME_QUOTE_RULES = """
 行情硬规则：
@@ -123,7 +124,24 @@ class MarketAgent(BaseAgent):
                 )
 
             # 1. 构建本轮增强上下文（不写入长期记忆，避免历史行情复活）
-            market_context, reply_quote_block = self._build_market_context_parts(message)
+            market_context, reply_quote_block, stock_data_valid = (
+                self._build_market_context_parts(message)
+            )
+            if not stock_data_valid:
+                self._log_final_user_data(
+                    session_id,
+                    reply_quote_block,
+                    STOCK_DATA_FAILURE_MESSAGE,
+                )
+                return AgentResponse(
+                    success=True,
+                    agent=AgentType.MARKET,
+                    message=STOCK_DATA_FAILURE_MESSAGE,
+                    metadata={
+                        "session_id": session_id,
+                        "data_available": False,
+                    },
+                )
 
             # 2. 带记忆的 AI 调用
             llm_response = self.deepseek.chat_with_memory(
@@ -181,11 +199,19 @@ class MarketAgent(BaseAgent):
             DeepSeekError: API 调用失败
         """
         market = self.config.get_market()
-        data_context, quote_valid, quote_block = self._build_stock_context(
+        data_context, data_valid, quote_block = self._build_stock_context(
             symbol,
             market,
         )
-        analysis_points = self._build_stock_analysis_points(quote_valid)
+        if not data_valid:
+            self._log_final_user_data(
+                "analyze_stock",
+                quote_block,
+                STOCK_DATA_FAILURE_MESSAGE,
+            )
+            return STOCK_DATA_FAILURE_MESSAGE
+
+        analysis_points = self._build_stock_analysis_points(data_valid)
         prompt = (
             f"你是一个专业的股票分析师。请分析股票 {symbol}（市场: {market}）。\\n\\n"
             f"{data_context}\\n\\n"
@@ -272,10 +298,10 @@ class MarketAgent(BaseAgent):
 
     def _build_market_context(self, message: str = "") -> str:
         """构建增强上下文文本。"""
-        context, _ = self._build_market_context_parts(message)
+        context, _, _ = self._build_market_context_parts(message)
         return context
 
-    def _build_market_context_parts(self, message: str = "") -> tuple[str, str]:
+    def _build_market_context_parts(self, message: str = "") -> tuple[str, str, bool]:
         """构建增强上下文文本
 
         包含当前市场配置和用户自选股信息，
@@ -312,14 +338,15 @@ class MarketAgent(BaseAgent):
         )
         parts.append(realtime_context)
         reply_quote_block = realtime_context
+        stock_data_valid = True
 
         if focus_symbol:
-            stock_context, _, reply_quote_block = self._build_stock_context(
+            stock_context, stock_data_valid, reply_quote_block = self._build_stock_context(
                 focus_symbol, market
             )
             parts.append(stock_context)
 
-        return "\n".join(parts), reply_quote_block
+        return "\n".join(parts), reply_quote_block, stock_data_valid
 
     def _build_realtime_context(
         self,
@@ -438,9 +465,43 @@ class MarketAgent(BaseAgent):
             quote_valid=quote_valid,
             failure_reason=failure_reason,
         )
+        if not quote_valid:
+            technical_block = self._build_unavailable_technical_block()
+            industry_block = self._build_unavailable_industry_block(symbol)
+            display_block = self._build_stock_display_block(
+                quote_block=block,
+                technical_block=technical_block,
+                industry_block=industry_block,
+            )
+            self._log_prompt_quote_data(
+                symbol=symbol,
+                quote_block=display_block,
+                quote_valid=False,
+                failure_reason=failure_reason or "invalid_quote",
+            )
+            return (
+                "\n".join([
+                    block,
+                    technical_block,
+                    industry_block,
+                    REALTIME_QUOTE_RULES,
+                    TECHNICAL_ANALYSIS_RULES,
+                    "行情状态：实时行情无效，禁止继续分析。",
+                ]),
+                False,
+                display_block,
+            )
 
-        technical_block = self._build_technical_block(symbol)
-        industry_block = self._build_industry_block(symbol)
+        technical_block, technical_valid, technical_failure = (
+            self._build_technical_block_with_status(symbol)
+        )
+        industry_block, industry_valid, industry_failure = (
+            self._build_industry_block_with_status(symbol)
+        )
+        data_valid = technical_valid and industry_valid
+        data_failure_reason = ";".join(
+            reason for reason in (technical_failure, industry_failure) if reason
+        )
         display_block = self._build_stock_display_block(
             quote_block=block,
             technical_block=technical_block,
@@ -449,8 +510,8 @@ class MarketAgent(BaseAgent):
         self._log_prompt_quote_data(
             symbol=symbol,
             quote_block=display_block,
-            quote_valid=quote_valid,
-            failure_reason=failure_reason,
+            quote_valid=data_valid,
+            failure_reason=data_failure_reason,
         )
 
         lines = [
@@ -462,13 +523,17 @@ class MarketAgent(BaseAgent):
             self._build_stock_reply_format_rules(),
         ]
 
-        if not quote_valid:
-            lines.append("分析范围：仅可分析基本面、行业逻辑和风险因素。")
+        if not data_valid:
+            lines.append("行情状态：AkShare 数据不完整，禁止继续分析。")
             return "\n".join(lines), False, display_block
 
         return "\n".join(lines), True, display_block
 
     def _build_technical_block(self, symbol: str) -> str:
+        block, _, _ = self._build_technical_block_with_status(symbol)
+        return block
+
+    def _build_technical_block_with_status(self, symbol: str) -> tuple[str, bool, str]:
         history = self._safe_market_data_call(
             "history",
             symbol,
@@ -487,8 +552,9 @@ class MarketAgent(BaseAgent):
             lambda: self.market_data.get_macd(symbol),
             default=None,
         )
+        failure_reasons = self._technical_failure_reasons(history, ma, macd)
 
-        return "\n".join([
+        block = "\n".join([
             "【技术分析】",
             f"近60日趋势：{self._format_history_trend(history)}",
             (
@@ -505,14 +571,20 @@ class MarketAgent(BaseAgent):
                 f"MACD={self._format_optional_number(self._value(macd, 'MACD'))}"
             ),
         ])
+        return block, not failure_reasons, ";".join(failure_reasons)
 
     def _build_industry_block(self, symbol: str) -> str:
+        block, _, _ = self._build_industry_block_with_status(symbol)
+        return block
+
+    def _build_industry_block_with_status(self, symbol: str) -> tuple[str, bool, str]:
         stock_info = self._safe_market_data_call(
             "stock_info",
             symbol,
             lambda: self.market_data.get_stock_info(symbol),
             default=None,
         )
+        failure_reasons = self._stock_info_failure_reasons(stock_info)
         name = self._value(stock_info, "name") or "未获取到可靠数据"
         industry = self._value(stock_info, "industry") or "未获取到可靠数据"
         concepts = self._value(stock_info, "concepts") or []
@@ -521,12 +593,59 @@ class MarketAgent(BaseAgent):
         else:
             concept_text = "未获取到可靠数据"
 
-        return "\n".join([
+        block = "\n".join([
             "【行业属性】",
             f"股票名称：{name}",
             f"所属行业：{industry}",
             f"所属概念：{concept_text}",
         ])
+        return block, not failure_reasons, ";".join(failure_reasons)
+
+    def _technical_failure_reasons(self, history: Any, ma: Any, macd: Any) -> list[str]:
+        reasons: list[str] = []
+        bars = list(history or [])
+        history_fields = ("date", "open", "high", "low", "close", "volume", "amount")
+        if len(bars) < 2:
+            reasons.append("history_empty")
+        else:
+            missing_history = [
+                field
+                for bar in bars
+                for field in history_fields
+                if self._value(bar, field) in (None, "")
+            ]
+            if missing_history:
+                reasons.append("history_missing_fields")
+
+        ma_fields = ("MA5", "MA10", "MA20", "MA60")
+        if ma is None:
+            reasons.append("ma_empty")
+        elif any(self._value(ma, field) in (None, "") for field in ma_fields):
+            reasons.append("ma_missing_fields")
+
+        macd_fields = ("DIF", "DEA", "MACD")
+        if macd is None:
+            reasons.append("macd_empty")
+        elif any(self._value(macd, field) in (None, "") for field in macd_fields):
+            reasons.append("macd_missing_fields")
+
+        return reasons
+
+    def _stock_info_failure_reasons(self, stock_info: Any) -> list[str]:
+        if stock_info is None:
+            return ["stock_info_empty"]
+
+        reasons: list[str] = []
+        if self._value(stock_info, "name") in (None, ""):
+            reasons.append("stock_info_missing_name")
+        if self._value(stock_info, "industry") in (None, ""):
+            reasons.append("stock_info_missing_industry")
+        concepts = self._value(stock_info, "concepts")
+        if not isinstance(concepts, (list, tuple)) or not [
+            item for item in concepts if item
+        ]:
+            reasons.append("stock_info_missing_concepts")
+        return reasons
 
     @staticmethod
     def _build_unavailable_technical_block() -> str:
