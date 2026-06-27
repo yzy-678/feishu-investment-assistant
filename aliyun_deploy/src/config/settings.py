@@ -5,8 +5,6 @@
 所有配置项均可通过环境变量覆盖。
 """
 
-from pathlib import Path
-
 from pydantic_settings import BaseSettings
 
 
@@ -52,17 +50,11 @@ class Settings(BaseSettings):
     database_path: str = "config/investment.db"
     """SQLite 数据库文件路径（相对于项目根目录）"""
 
-    data_source: str = "eastmoney"
-    """行情数据源：eastmoney / mock / yahoo"""
-
-    timezone: str = "Asia/Shanghai"
-    """应用时区，定时任务默认使用 Asia/Shanghai"""
-
-    daily_report_enabled: bool = True
-    """是否启用每日自动报告推送"""
+    data_source: str = "mock"
+    """行情数据源：mock / eastmoney / yahoo"""
 
     model_config = {
-        "env_file": str(Path(__file__).resolve().parent.parent.parent / ".env"),
+        "env_file": ".env",
         "env_file_encoding": "utf-8",
         "extra": "ignore",
     }

@@ -269,6 +269,34 @@ class TestChatWithMemory:
             assert sent_messages[0] == {"role": "system", "content": "摘要"}
 
     @patch("httpx.Client")
+    def test_chat_with_memory_transient_system_messages(
+        self,
+        mock_client_class: MagicMock,
+        client: DeepSeekClient,
+    ):
+        """本轮 system 消息应置顶，并过滤历史实时行情上下文"""
+        mock_client = make_mock_client(make_success_response("回复"))
+        mock_client_class.return_value = mock_client
+
+        with patch.object(client._memory, "get_context") as mock_get_ctx:
+            mock_get_ctx.return_value = [
+                {"role": "system", "content": "当前关注市场: CN。\n【实时行情】旧价格"},
+                {"role": "user", "content": "之前的话"},
+            ]
+            client.chat_with_memory(
+                "s",
+                "新问题",
+                system_messages=["新系统规则", "【实时行情】新价格"],
+            )
+
+            sent_messages = mock_client.post.call_args.kwargs["json"]["messages"]
+            assert sent_messages == [
+                {"role": "system", "content": "新系统规则"},
+                {"role": "system", "content": "【实时行情】新价格"},
+                {"role": "user", "content": "之前的话"},
+            ]
+
+    @patch("httpx.Client")
     def test_chat_with_memory_error(self, mock_client_class: MagicMock, client: DeepSeekClient):
         """记忆模块异常应转为 DeepSeekError"""
         mock_client = make_mock_client(make_success_response(""))

@@ -1,11 +1,7 @@
 from src.agents.base import BaseAgent, AgentType, AgentResponse
 from src.agents.coordinator import AgentCoordinator, get_coordinator
-from src.agents.general_agent import GeneralAgent, get_general_agent
-from src.agents.news_agent import NewsAgent, get_news_agent
 
 __all__ = [
     "BaseAgent", "AgentType", "AgentResponse",
     "AgentCoordinator", "get_coordinator",
-    "GeneralAgent", "get_general_agent",
-    "NewsAgent", "get_news_agent",
 ]

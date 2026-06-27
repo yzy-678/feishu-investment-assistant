@@ -6,16 +6,25 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Iterable, Optional, Sequence, Union
 
 import httpx
 
 from src.db.models import WatchlistItem
-from src.time_utils import shanghai_now
+from src.market.akshare_source import (
+    AkShareSource,
+    HistoryBar,
+    MACDSnapshot,
+    MASnapshot,
+    StockInfo,
+)
+from src.time_utils import SHANGHAI_TZ, shanghai_now
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +42,7 @@ EASTMONEY_HIS_BASE_URLS: tuple[str, ...] = (
 DEFAULT_TIMEOUT = 8.0
 RETRY_STATUS_CODES = {502, 503, 504}
 MAX_ATTEMPTS_PER_HOST = 2
+MAX_QUOTE_AGE_SECONDS = 300
 
 CN_INDEX_SECIDS: tuple[tuple[str, str], ...] = (
     ("1.000001", "上证指数"),
@@ -69,6 +79,9 @@ class QuoteSnapshot:
     fetched_at: str
     source: str = "EastMoney"
     timestamp: str = ""
+    data_age_seconds: Optional[int] = None
+    is_trading_session: bool = False
+    failure_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -91,8 +104,13 @@ class DailyBar:
 class MarketDataService:
     """统一的实时行情访问入口。"""
 
-    def __init__(self, timeout: float = DEFAULT_TIMEOUT) -> None:
+    def __init__(
+        self,
+        timeout: float = DEFAULT_TIMEOUT,
+        akshare_source: Optional[AkShareSource] = None,
+    ) -> None:
         self.timeout = timeout
+        self._akshare_source = akshare_source
 
     def supports_market(self, market: str) -> bool:
         return market.strip().upper() == "CN"
@@ -120,7 +138,8 @@ class MarketDataService:
                     "fields": ",".join(
                         [
                             "f57", "f58", "f43", "f44", "f45", "f46", "f47",
-                            "f48", "f60", "f168", "f169", "f170", "f171",
+                            "f48", "f60", "f80", "f86", "f168", "f169",
+                            "f170", "f171",
                         ]
                     ),
                 },
@@ -160,14 +179,35 @@ class MarketDataService:
             ) from exc
 
         logger.info(
-            "EastMoney quote success: symbol=%s price=%s change_pct=%s timestamp=%s source=%s",
+            "EastMoney quote success: symbol=%s price=%s change_pct=%s "
+            "timestamp=%s fetched_at=%s data_age_seconds=%s source=%s "
+            "failure_reason=%s",
             symbol,
             quote.price,
             quote.change_pct,
             quote.timestamp,
+            quote.fetched_at,
+            quote.data_age_seconds,
             quote.source,
+            quote.failure_reason,
         )
         return quote
+
+    def get_history(self, symbol: str, period: int = 60) -> list[HistoryBar]:
+        """获取历史 K 线。数据源：AkShare。"""
+        return self._akshare().get_history(symbol=symbol, period=period)
+
+    def get_ma(self, symbol: str) -> MASnapshot:
+        """获取 MA5 / MA10 / MA20 / MA60。数据源：AkShare。"""
+        return self._akshare().get_ma(symbol=symbol)
+
+    def get_macd(self, symbol: str) -> MACDSnapshot:
+        """获取 DIF / DEA / MACD。数据源：AkShare。"""
+        return self._akshare().get_macd(symbol=symbol)
+
+    def get_stock_info(self, symbol: str) -> StockInfo:
+        """获取股票名称、行业、概念板块。数据源：AkShare。"""
+        return self._akshare().get_stock_info(symbol=symbol)
 
     def get_index_quotes(self, market: str = "CN") -> list[QuoteSnapshot]:
         """获取主要指数快照。"""
@@ -184,7 +224,8 @@ class MarketDataService:
                     "fields": ",".join(
                         [
                             "f57", "f58", "f43", "f44", "f45", "f46", "f47",
-                            "f48", "f60", "f168", "f169", "f170", "f171",
+                            "f48", "f60", "f80", "f86", "f168", "f169",
+                            "f170", "f171",
                         ]
                     ),
                 },
@@ -503,6 +544,11 @@ class MarketDataService:
             reason=last_reason,
         ) from last_exc
 
+    def _akshare(self) -> AkShareSource:
+        if self._akshare_source is None:
+            self._akshare_source = AkShareSource()
+        return self._akshare_source
+
     @staticmethod
     def _to_secid(symbol: str) -> str:
         normalized = symbol.strip()
@@ -516,7 +562,34 @@ class MarketDataService:
 
     @staticmethod
     def _parse_quote(data: dict) -> QuoteSnapshot:
-        fetched_at = shanghai_now().strftime("%Y-%m-%d %H:%M:%S")
+        fetched_datetime = shanghai_now()
+        fetched_at = fetched_datetime.strftime("%Y-%m-%d %H:%M:%S")
+        timestamp_datetime = MarketDataService._parse_quote_timestamp(
+            data.get("f86")
+        )
+        timestamp = (
+            timestamp_datetime.strftime("%Y-%m-%d %H:%M:%S")
+            if timestamp_datetime is not None
+            else ""
+        )
+        data_age_seconds = (
+            max(0, int((fetched_datetime - timestamp_datetime).total_seconds()))
+            if timestamp_datetime is not None
+            else None
+        )
+        is_trading_session = MarketDataService._is_trading_session(
+            data.get("f80"),
+            fetched_datetime,
+        )
+        failure_reason = (
+            "stale_quote"
+            if (
+                is_trading_session
+                and data_age_seconds is not None
+                and data_age_seconds > MAX_QUOTE_AGE_SECONDS
+            )
+            else ""
+        )
         return QuoteSnapshot(
             symbol=str(data.get("f57", "")),
             name=str(data.get("f58", "")),
@@ -533,7 +606,49 @@ class MarketDataService:
             turnover_rate=MarketDataService._scaled_pct(data.get("f168")),
             fetched_at=fetched_at,
             source="EastMoney",
-            timestamp=fetched_at,
+            timestamp=timestamp,
+            data_age_seconds=data_age_seconds,
+            is_trading_session=is_trading_session,
+            failure_reason=failure_reason,
+        )
+
+    @staticmethod
+    def _parse_quote_timestamp(raw: object) -> Optional[datetime]:
+        if raw in (None, "", "-", 0, "0"):
+            return None
+        try:
+            timestamp = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if timestamp <= 0:
+            return None
+        try:
+            return datetime.fromtimestamp(timestamp, SHANGHAI_TZ)
+        except (OSError, OverflowError, ValueError):
+            return None
+
+    @staticmethod
+    def _is_trading_session(raw_sessions: object, now: datetime) -> bool:
+        if not raw_sessions:
+            return False
+        try:
+            sessions = (
+                json.loads(raw_sessions)
+                if isinstance(raw_sessions, str)
+                else raw_sessions
+            )
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(sessions, list):
+            return False
+
+        now_key = int(now.strftime("%Y%m%d%H%M"))
+        return any(
+            isinstance(session, dict)
+            and isinstance(session.get("b"), (int, float))
+            and isinstance(session.get("e"), (int, float))
+            and int(session["b"]) <= now_key <= int(session["e"])
+            for session in sessions
         )
 
     @staticmethod

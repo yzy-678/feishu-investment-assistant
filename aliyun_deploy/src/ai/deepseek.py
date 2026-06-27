@@ -87,25 +87,19 @@ class DeepSeekClient:
 
         return self._call_with_retry(messages, temperature, max_tokens)
 
-    def chat_with_memory(
-        self,
-        session_id: str,
-        user_message: str,
-        system_messages: Optional[list[str]] = None,
-    ) -> str:
+    def chat_with_memory(self, session_id: str, user_message: str) -> str:
         """结合对话记忆的智能回复
 
         自动完成：
         1. 保存用户消息到记忆
         2. 提取历史上下文
-        3. 注入本轮临时 system 上下文并调用 AI 获取回复
+        3. 调用 AI 获取回复
         4. 保存回复到记忆
         5. 检查是否需要触发摘要
 
         Args:
             session_id: 会话 ID（用户 open_id）
             user_message: 用户最新消息
-            system_messages: 仅用于本轮调用的 system 消息，不写入长期记忆
 
         Returns:
             AI 回复文本
@@ -119,11 +113,6 @@ class DeepSeekClient:
 
             # 2. 获取带摘要的上下文
             context = self._memory.get_context(session_id)
-            if system_messages:
-                context = self._merge_transient_system_messages(
-                    context,
-                    system_messages,
-                )
 
             # 3. 调用 AI
             response = self.chat(context)
@@ -140,44 +129,6 @@ class DeepSeekClient:
 
         except MemoryError as exc:
             raise DeepSeekError(f"记忆模块错误: {exc}") from exc
-
-    @staticmethod
-    def _merge_transient_system_messages(
-        context: list[dict],
-        system_messages: list[str],
-    ) -> list[dict]:
-        """把本轮 system 上下文放到最前，并丢弃历史行情 system 片段。
-
-        MarketAgent 早期会把实时行情写入长期记忆。这里在注入本轮
-        system_messages 时过滤掉旧的行情上下文，避免过期价格进入 prompt。
-        """
-        transient = [
-            {"role": "system", "content": msg}
-            for msg in system_messages
-            if msg
-        ]
-        cleaned_context = [
-            message
-            for message in context
-            if not DeepSeekClient._is_runtime_market_system_message(message)
-        ]
-        return transient + cleaned_context
-
-    @staticmethod
-    def _is_runtime_market_system_message(message: dict) -> bool:
-        if message.get("role") != "system":
-            return False
-
-        content = str(message.get("content") or "")
-        return any(
-            marker in content
-            for marker in (
-                "当前关注市场:",
-                "【实时行情】",
-                "【实时 A 股快照】",
-                "行情硬规则：",
-            )
-        )
 
     def health_check(self) -> bool:
         """检查 API 连通性

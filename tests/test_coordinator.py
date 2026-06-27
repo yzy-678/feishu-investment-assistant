@@ -351,6 +351,7 @@ class TestCoordinatorEdgeCases:
         assert AgentType.MARKET.value == "market"
         assert AgentType.REPORT.value == "report"
         assert AgentType.ALERT.value == "alert"
+        assert AgentType.NEWS.value == "news"
         assert AgentType.GENERAL.value == "general"
 
 

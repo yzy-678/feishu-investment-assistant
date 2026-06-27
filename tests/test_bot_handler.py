@@ -37,15 +37,18 @@ def mock_deps():
         patch("src.bot.handler.get_market_agent") as mock_market_agent,
         patch("src.bot.handler.get_report_agent") as mock_report_agent,
         patch("src.bot.handler.get_alert_agent") as mock_alert_agent,
+        patch("src.bot.handler.get_news_agent") as mock_news_agent,
         patch("src.bot.handler.get_general_agent") as mock_general_agent,
     ):
         market_agent = MagicMock()
         report_agent = MagicMock()
         alert_agent = MagicMock()
+        news_agent = MagicMock()
         general_agent = MagicMock()
         mock_market_agent.return_value = market_agent
         mock_report_agent.return_value = report_agent
         mock_alert_agent.return_value = alert_agent
+        mock_news_agent.return_value = news_agent
         mock_general_agent.return_value = general_agent
 
         handler = MessageHandler()
@@ -59,12 +62,28 @@ def mock_deps():
             "alert_agent": handler.alert_agent,
             "market_agent": market_agent,
             "report_agent": report_agent,
+            "news_agent": news_agent,
             "general_agent": general_agent,
             "mock_feishu_get": mock_f,
             "mock_coordinator_get": mock_c,
             "mock_config_get": mock_cfg,
             "mock_watchlist_get": mock_wl,
         }
+
+
+def test_register_agents_order(mock_deps):
+    """Agent 注册顺序：Market → Report → Alert → News → General。"""
+    registered = [
+        call.args[0]
+        for call in mock_deps["coordinator"].register.call_args_list
+    ]
+    assert registered == [
+        mock_deps["market_agent"],
+        mock_deps["report_agent"],
+        mock_deps["alert_agent"],
+        mock_deps["news_agent"],
+        mock_deps["general_agent"],
+    ]
 
 
 def make_text_event(text: str, open_id: str = "ou_test",

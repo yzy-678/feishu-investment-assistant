@@ -41,8 +41,9 @@ def create_app() -> FastAPI:
         init_database()
         logger.info("Database initialized")
 
-        from src.scheduler.background import start_scheduler
-        start_scheduler()
+        # 后台调度器（后续启用）
+        # from src.scheduler.background import start_scheduler
+        # start_scheduler()
 
         logger.info("Application started")
 
@@ -50,9 +51,6 @@ def create_app() -> FastAPI:
     async def shutdown() -> None:
         """应用关闭时清理"""
         from src.db import close_database
-        from src.scheduler.background import stop_scheduler
-
-        stop_scheduler()
 
         close_database()
         logger.info("Application stopped")

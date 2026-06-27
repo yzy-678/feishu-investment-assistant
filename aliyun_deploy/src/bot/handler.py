@@ -10,32 +10,21 @@
 import json
 import logging
 import re
-import threading
-import time
 from typing import Optional
 
 from src.ai.deepseek import DeepSeekError
-from src.agents.alert_agent import AlertAgent, get_alert_agent
 from src.bot.client import FeishuClient, FeishuError, get_feishu_client
 from src.config.manager import ConfigManager, get_config
 from src.watchlist.manager import WatchlistError, WatchlistManager, get_watchlist
-from src.agents.base import BaseAgent
 from src.agents.coordinator import AgentCoordinator, get_coordinator
-from src.agents.general_agent import get_general_agent
 from src.agents.market_agent import get_market_agent
-from src.agents.news_agent import get_news_agent
 from src.agents.report_agent import get_report_agent
+from src.agents.alert_agent import get_alert_agent
 
 logger = logging.getLogger(__name__)
 
 MAX_REPLY_LENGTH = 1500
 """飞书单条消息最大字符数"""
-
-MESSAGE_DEDUP_TTL_SECONDS = 600
-"""同一 message_id 的去重保留时间。"""
-
-MESSAGE_DEDUP_MAX_SIZE = 2048
-"""内存中最多保留的 message_id 数量。"""
 
 
 class CommandError(Exception):
@@ -56,36 +45,24 @@ class MessageHandler:
         self.coordinator: AgentCoordinator = get_coordinator()
         self.config: ConfigManager = get_config()
         self.watchlist: WatchlistManager = get_watchlist()
-        self.alert_agent: AlertAgent = get_alert_agent()
-        self._dedup_lock = threading.Lock()
-        self._inflight_message_ids: set[str] = set()
-        self._processed_message_ids: dict[str, float] = {}
         self._register_agents()
         logger.info("MessageHandler initialized")
 
-    # ── Agent 注册 ────────────────────────────────────────
+    # ── Agent 注册 ─────────────────────────────────────────
 
     def _register_agents(self) -> None:
-        """注册所有 Agent 到 Coordinator
-
-        确保各 Agent 的 can_handle() 能被 Coordinator 依次检查，
-        匹配到第一个能处理的消息后交由对应 Agent 处理。
-        """
-        agents: list[BaseAgent] = [
+        """向 Coordinator 注册所有 Agent"""
+        agents = [
             get_market_agent(),
             get_report_agent(),
-            self.alert_agent,
-            get_news_agent(),
-            get_general_agent(),
+            get_alert_agent(),
         ]
-
         for agent in agents:
             self.coordinator.register(agent)
-
         logger.info(
             "Registered %d agents: %s",
             len(agents),
-            [a.__class__.__name__ for a in agents],
+            ", ".join(a.__class__.__name__ for a in agents),
         )
 
     # ── 事件入口 ─────────────────────────────────────────
@@ -102,10 +79,6 @@ class MessageHandler:
         Returns:
             回复文本（用于日志/调试），None 表示无需回复
         """
-        message_id = ""
-        claimed = False
-        success = False
-
         try:
             # 只处理消息接收事件
             event_type = (
@@ -118,7 +91,7 @@ class MessageHandler:
             message = event.get("message", {})
             sender = event.get("sender", {}).get("sender_id", {})
 
-            message_id = message.get("message_id", "")
+            message_id: str = message.get("message_id", "")
             content_str: str = message.get("content", "{}")
             open_id: str = sender.get("open_id", "")
 
@@ -126,24 +99,16 @@ class MessageHandler:
                 logger.warning("Missing message_id or open_id in event")
                 return None
 
-            if not self._claim_message(message_id):
-                logger.info("Duplicate Feishu message ignored: %s", message_id)
-                return None
-
-            claimed = True
-
             # 解析消息内容
             try:
                 content_data = json.loads(content_str)
                 text = content_data.get("text", "").strip()
             except (json.JSONDecodeError, KeyError, TypeError) as exc:
                 logger.warning("Failed to parse message content: %s", exc)
-                success = True
                 return None
 
             if not text:
                 logger.debug("Empty message content, skipping")
-                success = True
                 return None
 
             # 处理消息
@@ -152,37 +117,18 @@ class MessageHandler:
             # 发送回复
             if reply:
                 truncated = reply[:MAX_REPLY_LENGTH]
-                logger.info(
-                    "Final reply to user data: %s",
-                    json.dumps(
-                        {
-                            "message_id": message_id,
-                            "open_id": open_id[:8],
-                            "max_reply_length": MAX_REPLY_LENGTH,
-                            "original_length": len(reply),
-                            "sent_length": len(truncated),
-                            "final_response": truncated,
-                        },
-                        ensure_ascii=False,
-                    ),
-                )
                 self.feishu.reply_text(message_id, truncated)
                 logger.info(
                     "Replied to %s: %.40s... (%d chars)",
                     open_id[:8], text, len(truncated),
                 )
-                success = True
                 return truncated
 
-            success = True
             return None
 
         except (FeishuError, DeepSeekError) as exc:
             logger.error("Handler error: %s", exc)
             return None
-        finally:
-            if claimed and message_id:
-                self._finalize_message(message_id, success)
 
     # ── 消息处理 ─────────────────────────────────────────
 
@@ -253,38 +199,7 @@ class MessageHandler:
             except ValueError as exc:
                 return f"❌ 设置失败: {exc}"
 
-        if text in ("立即扫描", "执行扫描", "扫描预警", "盘中扫描"):
-            return self._handle_manual_scan()
-
         return None  # 不是系统命令
-
-    def _handle_manual_scan(self) -> str:
-        """手动触发一次盘中预警扫描。"""
-        result = self.alert_agent.scan_watchlist()
-        alerts = result.get("alerts", [])
-        deliverable = [item for item in alerts if item.get("should_send")]
-
-        lines = [
-            "📡 盘中扫描完成",
-            f"数据源: {result['data_source']}",
-            f"扫描标的: {result['scanned']}",
-            f"触发预警: {result['triggered']}",
-            f"可推送预警: {result['deliverable']}",
-        ]
-
-        if deliverable:
-            for item in deliverable[:5]:
-                event = item["event"]
-                lines.append(
-                    f"- {event.related_code or event.title}: {event.title}（强度 {event.strength:.1f}）"
-                )
-            self.alert_agent.mark_delivered(
-                [item["event"].event_id for item in deliverable]
-            )
-        else:
-            lines.append(result["message"])
-
-        return "\n".join(lines)
 
     # ── 自选股管理 ───────────────────────────────────────
 
@@ -341,48 +256,6 @@ class MessageHandler:
             return f"❌ 操作失败: {exc}"
 
         return None  # 不是自选股命令
-
-    # ── 消息去重 ─────────────────────────────────────────
-
-    def _claim_message(self, message_id: str) -> bool:
-        """登记待处理 message_id，防止飞书重试导致重复回复。"""
-        now = time.time()
-
-        with self._dedup_lock:
-            self._cleanup_processed_messages(now)
-
-            if (
-                message_id in self._inflight_message_ids
-                or message_id in self._processed_message_ids
-            ):
-                return False
-
-            self._inflight_message_ids.add(message_id)
-            return True
-
-    def _finalize_message(self, message_id: str, success: bool) -> None:
-        """处理完成后更新去重状态。"""
-        with self._dedup_lock:
-            self._inflight_message_ids.discard(message_id)
-
-            if not success:
-                self._processed_message_ids.pop(message_id, None)
-                return
-
-            self._processed_message_ids[message_id] = time.time()
-            while len(self._processed_message_ids) > MESSAGE_DEDUP_MAX_SIZE:
-                oldest_message_id = next(iter(self._processed_message_ids))
-                self._processed_message_ids.pop(oldest_message_id, None)
-
-    def _cleanup_processed_messages(self, now: float) -> None:
-        """清理过期 message_id，避免内存无限增长。"""
-        expired_ids = [
-            message_id
-            for message_id, seen_at in self._processed_message_ids.items()
-            if now - seen_at > MESSAGE_DEDUP_TTL_SECONDS
-        ]
-        for message_id in expired_ids:
-            self._processed_message_ids.pop(message_id, None)
 
 
 # ── 全局单例访问函数 ─────────────────────────────────────
