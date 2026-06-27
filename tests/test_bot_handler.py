@@ -108,6 +108,13 @@ def make_text_event(text: str, open_id: str = "ou_test",
     }
 
 
+def make_text_event_with_content(content: str, open_id: str = "ou_test",
+                                 message_id: str = "om_test") -> dict:
+    event = make_text_event("", open_id=open_id, message_id=message_id)
+    event["event"]["message"]["content"] = content
+    return event
+
+
 # ═══════════════════════════════════════════════════════════
 #  系统命令测试
 # ═══════════════════════════════════════════════════════════
@@ -329,7 +336,107 @@ class TestEventParsing:
         """空文本"""
         event = make_text_event("")
         result = mock_deps["handler"].handle_event(event)
-        assert result is None
+        assert result == "消息不能为空，请重新输入。"
+        mock_deps["feishu"].reply_text.assert_called_once_with(
+            "om_test",
+            "消息不能为空，请重新输入。",
+        )
+
+    def test_parse_plain_chinese_stock_name(self, mock_deps):
+        """content='{"text":"有研新材"}' 必须完整传入 Coordinator。"""
+        mock_deps["coordinator"].route.return_value = AgentResponse(
+            success=True, agent=AgentType.MARKET, message="市场回复",
+        )
+        event = make_text_event_with_content(
+            '{"text":"有研新材"}',
+            message_id="om_cn_1",
+        )
+
+        result = mock_deps["handler"].handle_event(event)
+
+        assert result == "市场回复"
+        mock_deps["coordinator"].route.assert_called_once_with(
+            "ou_test",
+            "有研新材",
+        )
+
+    def test_parse_chinese_query_text(self, mock_deps):
+        """content='{"text":"查一下中瓷电子"}' 必须完整传入 Coordinator。"""
+        mock_deps["coordinator"].route.return_value = AgentResponse(
+            success=True, agent=AgentType.MARKET, message="市场回复",
+        )
+        event = make_text_event_with_content(
+            '{"text":"查一下中瓷电子"}',
+            message_id="om_cn_2",
+        )
+
+        result = mock_deps["handler"].handle_event(event)
+
+        assert result == "市场回复"
+        mock_deps["coordinator"].route.assert_called_once_with(
+            "ou_test",
+            "查一下中瓷电子",
+        )
+
+    def test_parse_text_with_at_bot_keeps_chinese(self, mock_deps):
+        """包含 @机器人 的飞书消息只移除 @ 标签，不破坏中文。"""
+        mock_deps["coordinator"].route.return_value = AgentResponse(
+            success=True, agent=AgentType.MARKET, message="市场回复",
+        )
+        event = make_text_event_with_content(
+            '{"text":"<at user_id=\\"ou_bot\\">投资助手</at> 查一下中瓷电子"}',
+            message_id="om_at_1",
+        )
+        event["event"]["message"]["mentions"] = [
+            {
+                "key": "@_user_1",
+                "name": "投资助手",
+                "id": {"open_id": "ou_bot"},
+            }
+        ]
+
+        result = mock_deps["handler"].handle_event(event)
+
+        assert result == "市场回复"
+        mock_deps["coordinator"].route.assert_called_once_with(
+            "ou_test",
+            "查一下中瓷电子",
+        )
+
+    def test_parse_text_with_at_placeholder_keeps_chinese(self, mock_deps):
+        """飞书 mentions[*].key 占位符只移除 @，不破坏后续中文。"""
+        mock_deps["coordinator"].route.return_value = AgentResponse(
+            success=True, agent=AgentType.MARKET, message="市场回复",
+        )
+        event = make_text_event_with_content(
+            '{"text":"@_user_1 有研新材"}',
+            message_id="om_at_2",
+        )
+        event["event"]["message"]["mentions"] = [
+            {"key": "@_user_1", "name": "投资助手"}
+        ]
+
+        result = mock_deps["handler"].handle_event(event)
+
+        assert result == "市场回复"
+        mock_deps["coordinator"].route.assert_called_once_with(
+            "ou_test",
+            "有研新材",
+        )
+
+    def test_reply_uses_original_message_id_for_feishu_quote(self, mock_deps):
+        """回复引用应使用原始 message_id，而不是清洗后的文本。"""
+        mock_deps["coordinator"].route.return_value = AgentResponse(
+            success=True, agent=AgentType.MARKET, message="市场回复",
+        )
+        event = make_text_event("有研新材", message_id="om_original_cn")
+
+        mock_deps["handler"].handle_event(event)
+
+        mock_deps["feishu"].reply_text.assert_called_once_with(
+            "om_original_cn",
+            "市场回复",
+        )
 
     def test_handle_fei_shu_error(self, mock_deps):
         """飞书 API 错误不应导致崩溃"""

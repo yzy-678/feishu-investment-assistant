@@ -121,6 +121,14 @@ class MessageHandler:
             message_id = message.get("message_id", "")
             content_str: str = message.get("content", "{}")
             open_id: str = sender.get("open_id", "")
+            logger.info(
+                "Feishu handler raw event payload: %s",
+                json.dumps(raw_event, ensure_ascii=False, default=str),
+            )
+            logger.info(
+                "Feishu event.message.content raw: %s",
+                content_str,
+            )
 
             if not message_id or not open_id:
                 logger.warning("Missing message_id or open_id in event")
@@ -135,16 +143,26 @@ class MessageHandler:
             # 解析消息内容
             try:
                 content_data = json.loads(content_str)
-                text = content_data.get("text", "").strip()
             except (json.JSONDecodeError, KeyError, TypeError) as exc:
                 logger.warning("Failed to parse message content: %s", exc)
                 success = True
                 return None
 
+            logger.info(
+                "Feishu json.loads(content) parsed: %s",
+                json.dumps(content_data, ensure_ascii=False, default=str),
+            )
+            text = self._extract_message_text(message, content_data)
+            logger.info(
+                "Feishu final message_text for coordinator: %s",
+                text,
+            )
+
             if not text:
-                logger.debug("Empty message content, skipping")
+                reply = "消息不能为空，请重新输入。"
+                self.feishu.reply_text(message_id, reply)
                 success = True
-                return None
+                return reply
 
             # 处理消息
             reply = self.process_message(open_id, message_id, text)
@@ -207,6 +225,54 @@ class MessageHandler:
         # 3. 通过 Coordinator 路由
         response = self.coordinator.route(open_id, text)
         return response.message
+
+    @classmethod
+    def _extract_message_text(cls, message: dict, content_data: object) -> str:
+        """从飞书 message.content 中提取最终用户文本。
+
+        飞书文本消息的 content 是 JSON 字符串，常见结构为
+        {"text": "..."}。群聊 @ 机器人时 text 中可能包含 <at ...>...</at>
+        或 mentions[*].key。这里只移除 @ 标签/占位符，不改写中文正文。
+        """
+        if not isinstance(content_data, dict):
+            return ""
+
+        raw_text = content_data.get("text", "")
+        if raw_text is None:
+            return ""
+        text = str(raw_text)
+
+        mentions = message.get("mentions", [])
+        if not isinstance(mentions, list):
+            mentions = []
+
+        text = cls._remove_feishu_mentions(text, mentions)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _remove_feishu_mentions(text: str, mentions: list[dict]) -> str:
+        """只删除飞书 @ 标签/占位符，保留其余中文。"""
+        cleaned = re.sub(r"<at\b[^>]*>.*?</at>", " ", text, flags=re.I | re.S)
+
+        for mention in mentions:
+            if not isinstance(mention, dict):
+                continue
+            candidates = [
+                mention.get("key"),
+                mention.get("name"),
+                mention.get("id", {}).get("open_id")
+                if isinstance(mention.get("id"), dict)
+                else None,
+            ]
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                value = str(candidate)
+                cleaned = cleaned.replace(value, " ")
+                if not value.startswith("@"):
+                    cleaned = cleaned.replace(f"@{value}", " ")
+
+        return cleaned
 
     # ── 系统命令 ─────────────────────────────────────────
 

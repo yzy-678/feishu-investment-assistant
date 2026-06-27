@@ -43,6 +43,10 @@ async def feishu_event(
     2. 消息接收事件（im.message.receive_v1）
     """
     raw = await request.json()
+    logger.info(
+        "Feishu raw event payload: %s",
+        json.dumps(raw, ensure_ascii=False, default=str),
+    )
 
     # ── URL 验证挑战 ────────────────────────────────────
     if raw.get("type") == "url_verification":
