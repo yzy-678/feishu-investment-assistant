@@ -333,6 +333,58 @@ class TestHandle:
         assert "MA5=999" not in resp.message
         assert "资金偏弱" in resp.message
 
+    def test_handle_keeps_analysis_sentences_with_market_terms(self, mock_deps):
+        """分析正文提到成交额/均线/MACD 时，不应被误删。"""
+        mock_deps["deepseek"].chat_with_memory.return_value = (
+            "🧠 AI综合判断\n"
+            "结论：有研新材近60日涨幅接近190%，当前单日成交额高达83.76亿，这是典型的主升浪加速段。\n\n"
+            "逻辑：股价已大幅脱离MA20和MA60等中长期均线，MACD处于高位正值，说明多头动能仍然强劲。\n\n"
+            "⚠ 风险提示\n"
+            "单日83亿成交额是典型筹码交换信号，股价远离均线，技术上有强烈的回踩MA5甚至MA20的需求。"
+        )
+
+        resp = mock_deps["agent"].handle("session1", "分析 000001")
+
+        assert "近60日涨幅接近190%" in resp.message
+        assert "当前单日成交额高达83.76亿" in resp.message
+        assert "MA20和MA60" in resp.message
+        assert "MACD处于高位正值" in resp.message
+        assert "单日83亿成交额是典型筹码交换信号" in resp.message
+        assert "回踩MA5甚至MA20" in resp.message
+
+    def test_handle_removes_only_llm_quote_blocks_but_keeps_following_analysis(
+        self,
+        mock_deps,
+    ):
+        """即使 LLM 先输出重复行情块，后面的分析正文也要完整保留。"""
+        mock_deps["deepseek"].chat_with_memory.return_value = (
+            "【实时行情】\n"
+            "数据来源：LLM\n"
+            "数据时间：2099-01-01 00:00:00\n"
+            "当前价：999.99\n"
+            "涨跌幅：+99.99%\n\n"
+            "【技术分析】\n"
+            "MA5=999\n"
+            "MACD=999\n\n"
+            "【行业属性】\n"
+            "所属行业：LLM行业\n"
+            "所属概念：LLM概念\n\n"
+            "🧠 AI综合判断\n"
+            "逻辑：股价已大幅脱离MA20和MA60，MACD处于高位正值，但这属于分析解释，不应被删除。\n\n"
+            "⚠ 风险提示\n"
+            "风险：单日83亿成交额若无法延续，可能形成高位震荡。"
+        )
+
+        resp = mock_deps["agent"].handle("session1", "分析 000001")
+
+        assert "LLM行业" not in resp.message
+        assert "999.99" not in resp.message
+        assert "MA5=999" not in resp.message
+        assert "MACD=999" not in resp.message
+        assert "股价已大幅脱离MA20和MA60" in resp.message
+        assert "MACD处于高位正值" in resp.message
+        assert "单日83亿成交额若无法延续" in resp.message
+
     def test_handle_blocks_suspect_llm_garbled_text(self, mock_deps):
         """LLM 分析段出现疑似乱码/错字时，不能直接发给用户。"""
         garbled_a = "冲" + "啥"

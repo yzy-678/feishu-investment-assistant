@@ -1093,11 +1093,10 @@ class MarketAgent(BaseAgent):
                     skipping_quote_block = False
                 elif stripped.startswith("【") and "实时" not in stripped:
                     skipping_quote_block = False
+                elif stripped.startswith(("🧠", "⚠")):
+                    skipping_quote_block = False
                 else:
                     continue
-
-            if self._looks_like_llm_quote_line(stripped):
-                continue
 
             cleaned.append(line)
 
@@ -1125,43 +1124,6 @@ class MarketAgent(BaseAgent):
             or normalized.startswith("🏭行业属性")
             or normalized.startswith("实时行情")
             or normalized.startswith("实时A股快照")
-        )
-
-    @staticmethod
-    def _looks_like_llm_quote_line(text: str) -> bool:
-        if not text:
-            return False
-
-        quote_labels = (
-            "数据来源",
-            "数据时间",
-            "当前价",
-            "最新价",
-            "涨跌幅",
-            "成交额",
-            "成交量",
-            "EastMoney",
-            "近60日趋势",
-            "均线",
-            "MA5",
-            "MA10",
-            "MA20",
-            "MA60",
-            "MACD",
-            "DIF",
-            "DEA",
-            "股票名称",
-            "所属行业",
-            "所属概念",
-        )
-        if any(label in text for label in quote_labels):
-            return True
-
-        return bool(
-            re.search(
-                r"(当前|最新|股价|价格|涨跌|成交|截至).{0,20}(\d|[+-])",
-                text,
-            )
         )
 
     def _quote_log_payload(
