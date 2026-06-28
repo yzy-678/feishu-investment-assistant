@@ -19,7 +19,7 @@ from typing import Optional
 import httpx
 
 from src.config.settings import settings
-from src.bot.text_utils import sanitize_text
+from src.bot.text_utils import sanitize_markdown_for_text
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +141,10 @@ class FeishuClient:
         Returns:
             API 响应 JSON
         """
-        safe_content = sanitize_text(content)
+        logger.info("BEFORE_SANITIZE %r", content)
+        safe_content = sanitize_markdown_for_text(content)
+        logger.info("AFTER_SANITIZE %r", safe_content)
+        logger.info("SEND_TO_FEISHU %r", safe_content)
         body = {
             "receive_id": receive_id,
             "msg_type": "text",
@@ -164,7 +167,10 @@ class FeishuClient:
         Returns:
             API 响应 JSON
         """
-        safe_content = sanitize_text(content)
+        logger.info("BEFORE_SANITIZE %r", content)
+        safe_content = sanitize_markdown_for_text(content)
+        logger.info("AFTER_SANITIZE %r", safe_content)
+        logger.info("SEND_TO_FEISHU %r", safe_content)
         body = {
             "msg_type": "text",
             "content": json.dumps({"text": safe_content}, ensure_ascii=False),

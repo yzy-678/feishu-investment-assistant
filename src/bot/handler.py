@@ -17,7 +17,7 @@ from typing import Optional
 from src.ai.deepseek import DeepSeekError
 from src.agents.alert_agent import AlertAgent, get_alert_agent
 from src.bot.client import FeishuClient, FeishuError, get_feishu_client
-from src.bot.text_utils import sanitize_text
+from src.bot.text_utils import sanitize_markdown_for_text, sanitize_text
 from src.config.manager import ConfigManager, get_config
 from src.config.settings import settings
 from src.watchlist.manager import WatchlistError, WatchlistManager, get_watchlist
@@ -177,8 +177,11 @@ class MessageHandler:
 
             # 发送回复
             if reply:
-                truncated = sanitize_text(reply[:MAX_REPLY_LENGTH])
-                logger.info("BotHandler final_text repr before Feishu: %r", truncated)
+                raw_reply = reply[:MAX_REPLY_LENGTH]
+                logger.info("BEFORE_SANITIZE %r", raw_reply)
+                truncated = sanitize_markdown_for_text(raw_reply)
+                logger.info("AFTER_SANITIZE %r", truncated)
+                logger.info("SEND_TO_FEISHU %r", truncated)
                 logger.info(
                     "Final reply to user data: %s",
                     json.dumps(
@@ -228,6 +231,7 @@ class MessageHandler:
         默认不使用 message reply，避免飞书客户端引用预览乱码。
         有 chat_id 时发送普通群消息；缺失 chat_id 时回退到原 reply_text。
         """
+        logger.info("SEND_TO_FEISHU %r", content)
         if settings.use_reply_message:
             self.feishu.reply_text(message_id, content)
             return

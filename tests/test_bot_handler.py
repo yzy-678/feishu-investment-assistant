@@ -508,6 +508,36 @@ class TestEventParsing:
             "市场回复",
         )
 
+    @pytest.mark.parametrize(
+        "message_text",
+        [
+            "估值回归将非常惨烈",
+            "放量滞涨或快速回落",
+            "高位巨量换手风险",
+        ],
+    )
+    def test_outgoing_chinese_text_stays_exact(self, mock_deps, message_text):
+        mock_deps["coordinator"].route.return_value = AgentResponse(
+            success=True,
+            agent=AgentType.MARKET,
+            message=message_text,
+        )
+        event = make_text_event(
+            "有研新材",
+            message_id="om_exact_cn",
+            chat_id="oc_group_exact",
+        )
+
+        with patch("src.bot.handler.settings.use_reply_message", False):
+            result = mock_deps["handler"].handle_event(event)
+
+        assert result == message_text
+        mock_deps["feishu"].send_text.assert_called_once_with(
+            "oc_group_exact",
+            message_text,
+            receive_id_type="chat_id",
+        )
+
     def test_handle_fei_shu_error(self, mock_deps):
         """飞书 API 错误不应导致崩溃"""
         mock_deps["feishu"].reply_text.side_effect = FeishuError("API error")

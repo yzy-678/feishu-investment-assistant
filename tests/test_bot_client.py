@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from src.bot import FeishuClient, FeishuError, get_feishu_client
-from src.bot.text_utils import sanitize_text
+from src.bot.text_utils import sanitize_markdown_for_text, sanitize_text
 
 
 # ── Mock 辅助函数 ──────────────────────────────────────
@@ -263,6 +263,7 @@ class TestReplyText:
         call = mock_cli.post.call_args_list[1]
         assert "messages/om_original/reply" in call.args[0]
         assert call.kwargs["json"]["msg_type"] == "text"
+        assert json.loads(call.kwargs["json"]["content"])["text"] == "回复内容"
 
 
 def test_sanitize_text_keeps_normal_chinese_and_failure_message():
@@ -272,6 +273,24 @@ def test_sanitize_text_keeps_normal_chinese_and_failure_message():
         == "实时数据获取失败，暂时无法分析"
     )
     assert sanitize_text("有研新材\u200b") == "有研新材"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "估值回归将非常惨烈",
+        "放量滞涨或快速回落",
+        "高位巨量换手风险",
+    ],
+)
+def test_sanitize_markdown_for_text_keeps_chinese_exact(text):
+    assert sanitize_markdown_for_text(text) == text
+
+
+def test_sanitize_markdown_for_text_only_removes_markdown_symbols():
+    assert sanitize_markdown_for_text("### **估值回归将非常惨烈**") == "估值回归将非常惨烈"
+    assert sanitize_markdown_for_text("```放量滞涨或快速回落```") == "放量滞涨或快速回落"
+    assert sanitize_markdown_for_text("高位  巨量   换手风险") == "高位 巨量 换手风险"
 
 
 # ── send_markdown 测试 ─────────────────────────────────
