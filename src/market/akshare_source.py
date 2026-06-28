@@ -14,9 +14,12 @@ from typing import Any, Optional
 import httpx
 from pydantic import BaseModel, Field
 
+from src.market.provider_utils import ProviderTimeoutError, run_with_timeout
+
 logger = logging.getLogger(__name__)
 
 EASTMONEY_QUOTE_URL = "https://push2.eastmoney.com/api/qt/stock/get"
+DEFAULT_AKSHARE_TIMEOUT_SECONDS = 5.0
 
 
 class AkShareError(Exception):
@@ -66,17 +69,26 @@ class StockInfo(BaseModel):
 class AkShareSource:
     """AkShare 统一访问层。"""
 
-    def __init__(self, ak_module: Any = None) -> None:
+    def __init__(
+        self,
+        ak_module: Any = None,
+        timeout: float = DEFAULT_AKSHARE_TIMEOUT_SECONDS,
+    ) -> None:
         self._ak = ak_module
+        self.timeout = timeout
 
     def get_history(self, symbol: str, period: int = 60) -> list[HistoryBar]:
         """获取最近 period 条日 K 线。"""
         self._log_request("stock_zh_a_hist", symbol, period=period)
         try:
-            frame = self._akshare().stock_zh_a_hist(
-                symbol=symbol,
-                period="daily",
-                adjust="qfq",
+            frame = run_with_timeout(
+                lambda: self._akshare().stock_zh_a_hist(
+                    symbol=symbol,
+                    period="daily",
+                    adjust="qfq",
+                ),
+                self.timeout,
+                f"AkShare stock_zh_a_hist {symbol}",
             )
             records = self._records(frame, tail=period)
             bars = [
@@ -86,6 +98,9 @@ class AkShareSource:
             ]
             self._log_success("stock_zh_a_hist", symbol, rows=len(bars))
             return bars
+        except ProviderTimeoutError as exc:
+            self._log_failed("stock_zh_a_hist", symbol, exc)
+            raise AkShareError(f"AkShare 历史 K 线获取超时: {exc}") from exc
         except Exception as exc:
             self._log_failed("stock_zh_a_hist", symbol, exc)
             raise AkShareError(f"AkShare 历史 K 线获取失败: {exc}") from exc
@@ -131,7 +146,11 @@ class AkShareSource:
         self._log_request("stock_individual_info_em", symbol)
         try:
             try:
-                frame = self._akshare().stock_individual_info_em(symbol=symbol)
+                frame = run_with_timeout(
+                    lambda: self._akshare().stock_individual_info_em(symbol=symbol),
+                    self.timeout,
+                    f"AkShare stock_individual_info_em {symbol}",
+                )
                 info = self._key_value_map(frame)
             except Exception as exc:
                 self._log_failed("stock_individual_info_em", symbol, exc)
@@ -175,7 +194,11 @@ class AkShareSource:
 
         self._log_request("stock_hot_keyword_em", symbol)
         try:
-            frame = ak.stock_hot_keyword_em(symbol=symbol)
+            frame = run_with_timeout(
+                lambda: ak.stock_hot_keyword_em(symbol=symbol),
+                self.timeout,
+                f"AkShare stock_hot_keyword_em {symbol}",
+            )
             records = self._records(frame)
             concepts: list[str] = []
             for row in records:

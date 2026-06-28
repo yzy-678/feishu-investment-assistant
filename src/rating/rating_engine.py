@@ -9,8 +9,34 @@ from typing import Optional, Protocol
 from src.db import get_database
 from src.market.akshare_source import HistoryBar, StockInfo
 from src.market.service import MarketDataError, QuoteSnapshot, get_market_data_service
-from src.rating.rating_models import InvestmentRating, RatingInputData, RatingLevel
+from src.providers import (
+    CacheManager,
+    CachedKlineProvider,
+    CachedSectorProvider,
+    KlineProvider,
+    ProviderResult,
+    SectorProvider as UnifiedSectorProvider,
+    get_cache_manager,
+)
+from src.providers.rating_adapters import (
+    EastMoneyKlineProvider,
+    FallbackKlineProvider,
+    MarketDataKlineProvider,
+    RatingSectorProvider,
+)
+from src.rating.rating_models import (
+    DataQualityItem,
+    DataQualityReport,
+    InvestmentRating,
+    RatingInputData,
+    RatingLevel,
+)
 from src.rating.score_calculator import InvestmentScoreCalculator
+from src.rating.sector_provider import (
+    EastMoneyRawSectorSource,
+    SectorContext,
+    SectorProvider as RatingSectorSource,
+)
 from src.time_utils import shanghai_now, shanghai_today
 
 logger = logging.getLogger(__name__)
@@ -42,10 +68,43 @@ class InvestmentRatingEngine:
         self,
         market_data: Optional[MarketDataProvider] = None,
         score_calculator: Optional[InvestmentScoreCalculator] = None,
+        sector_provider: Optional[RatingSectorSource] = None,
+        kline_provider: Optional[KlineProvider] = None,
+        rating_sector_provider: Optional[UnifiedSectorProvider] = None,
+        cache_manager: Optional[CacheManager] = None,
         persist_history: bool = True,
     ) -> None:
+        using_default_market_data = market_data is None
         self.market_data = market_data or get_market_data_service()
         self.score_calculator = score_calculator or InvestmentScoreCalculator()
+        self.sector_provider = sector_provider or RatingSectorSource(
+            eastmoney_raw_source=EastMoneyRawSectorSource(),
+            akshare_provider=self.market_data,
+        )
+        self.cache_manager = cache_manager or (
+            get_cache_manager() if using_default_market_data else None
+        )
+        base_kline_provider = kline_provider or FallbackKlineProvider(
+            [
+                MarketDataKlineProvider(self.market_data),
+                EastMoneyKlineProvider(self.market_data),
+            ]
+        )
+        base_sector_provider = rating_sector_provider or RatingSectorProvider(
+            self.sector_provider
+        )
+        if self.cache_manager is not None and kline_provider is None:
+            base_kline_provider = CachedKlineProvider(
+                base_kline_provider,
+                cache_manager=self.cache_manager,
+            )
+        if self.cache_manager is not None and rating_sector_provider is None:
+            base_sector_provider = CachedSectorProvider(
+                base_sector_provider,
+                cache_manager=self.cache_manager,
+            )
+        self.kline_provider = base_kline_provider
+        self.rating_sector_provider = base_sector_provider
         self.persist_history = persist_history
         self._db = get_database() if persist_history else None
         if self._db is not None:
@@ -55,8 +114,13 @@ class InvestmentRatingEngine:
         """Evaluate a stock with truthful market data and deterministic rules."""
         normalized_symbol = symbol.strip().upper()
         quote, quote_warning = self._safe_get_quote(normalized_symbol)
-        history, history_warning = self._safe_get_history(normalized_symbol)
+        history, history_warning, history_quality = self._safe_get_history(
+            normalized_symbol
+        )
         stock_info, info_warning = self._safe_get_stock_info(normalized_symbol)
+        sector_context, sector_quality = self._safe_get_sector_context(
+            normalized_symbol
+        )
         index_change_pct, index_warning = self._safe_get_index_change_pct()
 
         input_data = RatingInputData(
@@ -66,10 +130,15 @@ class InvestmentRatingEngine:
             stock_info=stock_info,
             index_change_pct=index_change_pct,
             industry_change_pct=None,
-            sector_heat_score=None,
-            sector_continuity_score=None,
-            is_main_sector=None,
-            sector_linkage_score=None,
+            sector_heat_score=sector_context.sector_heat_score,
+            sector_continuity_score=sector_context.sector_continuity_score,
+            is_main_sector=sector_context.is_main_sector,
+            sector_linkage_score=sector_context.sector_linkage_score,
+            industry_score=sector_context.industry_score,
+            concept_score=sector_context.concept_score,
+            industry_available=sector_context.industry_available,
+            concepts_available=sector_context.concepts_available,
+            sector_available=_sector_scoring_available(sector_context),
         )
         breakdown = self.score_calculator.calculate(input_data)
         warnings = [
@@ -78,6 +147,7 @@ class InvestmentRatingEngine:
                 quote_warning,
                 history_warning,
                 info_warning,
+                sector_context.warning,
                 index_warning,
                 *breakdown.warnings,
                 RATING_DATA_SCOPE_WARNING,
@@ -90,6 +160,18 @@ class InvestmentRatingEngine:
         score_change = _score_change(total_score, previous)
         change_direction = _change_direction(score_change)
         change_reasons = _change_reasons(breakdown.evidence, previous, breakdown)
+        data_quality = _data_quality_report(
+            quote=quote,
+            quote_warning=quote_warning,
+            history=history,
+            history_quality=history_quality,
+            stock_info=stock_info,
+            info_warning=info_warning,
+            sector_context=sector_context,
+            sector_quality=sector_quality,
+            index_warning=index_warning,
+            sector_score=breakdown.sector_score,
+        )
 
         rating = InvestmentRating(
             symbol=normalized_symbol,
@@ -108,9 +190,16 @@ class InvestmentRatingEngine:
             summary="；".join(breakdown.summary_parts),
             warning="；".join(warnings) if warnings else "暂无明显数据风险。",
             timestamp=shanghai_now().strftime("%Y-%m-%d %H:%M:%S"),
-            data_source=_data_source(quote, history, stock_info),
+            data_source=_data_source(quote, history, stock_info, sector_context),
+            data_quality=data_quality,
             reserved={
                 "evidence": breakdown.evidence,
+                "data_quality": data_quality.as_dict(),
+                "industry_score": breakdown.industry_score,
+                "concept_score": breakdown.concept_score,
+                "industry": sector_context.industry,
+                "concepts": sector_context.concepts,
+                "sector_status": sector_context.sector_status,
                 "future_extensions": [
                     "fundamental_score",
                     "news_score",
@@ -132,13 +221,25 @@ class InvestmentRatingEngine:
             logger.warning("Rating quote unavailable: symbol=%s error=%s", symbol, exc)
             return None, f"实时行情不可用：{exc}"
 
-    def _safe_get_history(self, symbol: str) -> tuple[list[HistoryBar], str]:
-        try:
-            history = self.market_data.get_history(symbol, period=60)
-            return history, "" if history else "历史K线为空"
-        except Exception as exc:
-            logger.warning("Rating history unavailable: symbol=%s error=%s", symbol, exc)
-            return [], f"历史K线不可用：{exc}"
+    def _safe_get_history(
+        self,
+        symbol: str,
+    ) -> tuple[list[HistoryBar], str, DataQualityItem]:
+        result = self.kline_provider.get_history(symbol, period=60)
+        history = result.data or []
+        quality = _quality_item_from_result("历史K线", result, included=bool(history))
+        if result.ok:
+            return history, "" if history else (result.message or "历史K线为空"), quality
+        logger.warning(
+            "Rating history provider unavailable: symbol=%s source=%s "
+            "status=%s error_type=%s message=%s",
+            symbol,
+            result.source,
+            result.status.value,
+            result.error_type,
+            result.message,
+        )
+        return [], result.message or "历史K线不可用", quality
 
     def _safe_get_stock_info(
         self,
@@ -148,7 +249,30 @@ class InvestmentRatingEngine:
             return self.market_data.get_stock_info(symbol), ""
         except Exception as exc:
             logger.warning("Rating stock info unavailable: symbol=%s error=%s", symbol, exc)
-            return None, f"股票基础信息不可用：{exc}"
+            return None, "股票基础信息不可用"
+
+    def _safe_get_sector_context(
+        self,
+        symbol: str,
+    ) -> tuple[SectorContext, DataQualityItem]:
+        result = self.rating_sector_provider.get_sector_context(symbol)
+        quality = _quality_item_from_result(
+            "板块上下文",
+            result,
+            included=bool(result.data and result.data.available),
+        )
+        if result.data is not None:
+            return result.data, quality
+        logger.warning(
+            "Rating sector provider unavailable: symbol=%s source=%s "
+            "status=%s error_type=%s message=%s",
+            symbol,
+            result.source,
+            result.status.value,
+            result.error_type,
+            result.message,
+        )
+        return SectorContext(), quality
 
     def _safe_get_index_change_pct(self) -> tuple[float, str]:
         try:
@@ -222,6 +346,80 @@ class InvestmentRatingEngine:
         conn.commit()
 
 
+def _quality_item_from_result(
+    name: str,
+    result: ProviderResult,
+    *,
+    included: bool,
+) -> DataQualityItem:
+    metadata = result.metadata or {}
+    return DataQualityItem(
+        name=name,
+        source=result.source,
+        status=result.status.value,
+        message=result.message,
+        cache_hit=bool(metadata.get("cache_hit")),
+        fallback=bool(metadata.get("fallback")),
+        included=included and result.ok,
+    )
+
+
+def _data_quality_report(
+    *,
+    quote: Optional[QuoteSnapshot],
+    quote_warning: str,
+    history: list[HistoryBar],
+    history_quality: DataQualityItem,
+    stock_info: Optional[StockInfo],
+    info_warning: str,
+    sector_context: SectorContext,
+    sector_quality: DataQualityItem,
+    index_warning: str,
+    sector_score: Optional[float],
+) -> DataQualityReport:
+    items = [
+        DataQualityItem(
+            name="实时行情",
+            source=(quote.source if quote else "EastMoney"),
+            status="success" if quote else "failed",
+            message=quote_warning,
+            included=quote is not None,
+        ),
+        history_quality,
+        DataQualityItem(
+            name="股票基础信息",
+            source="AkShare",
+            status="success" if stock_info else "failed",
+            message=info_warning,
+            included=stock_info is not None,
+        ),
+        sector_quality,
+        DataQualityItem(
+            name="指数行情",
+            source="EastMoney",
+            status="success" if not index_warning else "partial",
+            message=index_warning,
+            included=not index_warning,
+        ),
+    ]
+
+    missing: list[str] = []
+    if quote is None:
+        missing.append("实时行情")
+    if not history:
+        missing.append("历史K线")
+    if stock_info is None:
+        missing.append("股票基础信息")
+    if sector_score is None:
+        missing.append("板块评分")
+    elif sector_context.sector_status == "部分纳入":
+        missing.append("部分板块数据")
+    if index_warning:
+        missing.append("指数行情")
+
+    return DataQualityReport(items=items, missing_dimensions=missing)
+
+
 def rating_level(total_score: float) -> RatingLevel:
     if total_score >= 95:
         return RatingLevel.S
@@ -254,13 +452,26 @@ def _data_source(
     quote: Optional[QuoteSnapshot],
     history: list[HistoryBar],
     stock_info: Optional[StockInfo],
+    sector_context: SectorContext,
 ) -> str:
     sources: list[str] = []
+    def add_source(value: str) -> None:
+        for item in str(value or "").split(","):
+            source = item.strip()
+            if source and source not in sources:
+                sources.append(source)
+
     if quote:
-        sources.append(quote.source or "EastMoney")
+        add_source(quote.source or "EastMoney")
     if history or stock_info:
-        sources.append("AkShare")
-    return ", ".join(dict.fromkeys(sources)) or "数据不足"
+        add_source("AkShare")
+    if sector_context.data_source:
+        add_source(sector_context.data_source)
+    return ", ".join(sources) or "数据不足"
+
+
+def _sector_scoring_available(context: SectorContext) -> bool:
+    return context.available
 
 
 def _score_change(
@@ -309,7 +520,14 @@ def _change_reasons(
     ]
     reasons: list[str] = []
     for field, label, current_score, current_evidence in comparisons:
-        previous_score = float(previous[field] or 0.0)
+        if current_score is None:
+            if field == "sector_score":
+                reasons.append("板块评分暂未纳入，行业/概念或板块统计数据暂不可用。")
+            continue
+        previous_value = previous[field]
+        if previous_value is None:
+            continue
+        previous_score = float(previous_value)
         delta = round(current_score - previous_score, 2)
         if delta > 0:
             reasons.append(_positive_change_reason(label, delta, current_evidence))

@@ -11,8 +11,13 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
 
 from src.market.akshare_source import AkShareError, HistoryBar
+from src.market.provider_utils import ProviderTimeoutError, run_with_timeout
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_AKSHARE_HISTORY_TIMEOUT_SECONDS = 5.0
+DEFAULT_AKSHARE_FULL_MARKET_TIMEOUT_SECONDS = 20.0
+DEFAULT_AKSHARE_BOARD_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -67,13 +72,33 @@ class AkShareProvider:
     负责获取全市场实时行情、历史 K 线、成交量、成交额和热点板块。
     """
 
-    def __init__(self, ak_module: Any = None) -> None:
+    def __init__(
+        self,
+        ak_module: Any = None,
+        history_timeout: float = DEFAULT_AKSHARE_HISTORY_TIMEOUT_SECONDS,
+        full_market_timeout: float = DEFAULT_AKSHARE_FULL_MARKET_TIMEOUT_SECONDS,
+        board_timeout: float = DEFAULT_AKSHARE_BOARD_TIMEOUT_SECONDS,
+    ) -> None:
         self._ak = ak_module
+        self.history_timeout = history_timeout
+        self.full_market_timeout = full_market_timeout
+        self.board_timeout = board_timeout
 
     def get_realtime_quotes(self) -> list[RealtimeQuote]:
         """获取 A 股全市场实时行情。"""
         try:
-            frame = self._akshare().stock_zh_a_spot_em()
+            frame = run_with_timeout(
+                lambda: self._akshare().stock_zh_a_spot_em(),
+                self.full_market_timeout,
+                "AkShare stock_zh_a_spot_em",
+            )
+        except ProviderTimeoutError as exc:
+            logger.warning(
+                "AkShare provider timeout: provider_failed=true degraded=true "
+                "function=stock_zh_a_spot_em error=%s",
+                exc,
+            )
+            raise AkShareError(f"AkShare 全市场实时行情获取超时: {exc}") from exc
         except Exception as exc:
             raise AkShareError(f"AkShare 全市场实时行情获取失败: {exc}") from exc
 
@@ -99,11 +124,17 @@ class AkShareProvider:
     def get_history(self, symbol: str, period: int = 60) -> list[HistoryBar]:
         """获取最近 period 条日 K，包含成交量和成交额。"""
         try:
-            frame = self._akshare().stock_zh_a_hist(
-                symbol=symbol,
-                period="daily",
-                adjust="qfq",
+            frame = run_with_timeout(
+                lambda: self._akshare().stock_zh_a_hist(
+                    symbol=symbol,
+                    period="daily",
+                    adjust="qfq",
+                ),
+                self.history_timeout,
+                f"AkShare stock_zh_a_hist {symbol}",
             )
+        except ProviderTimeoutError as exc:
+            raise AkShareError(f"AkShare 历史 K 线获取超时: {exc}") from exc
         except Exception as exc:
             raise AkShareError(f"AkShare 历史 K 线获取失败: {exc}") from exc
 
@@ -132,7 +163,18 @@ class AkShareProvider:
             return set()
 
         try:
-            frame = ak.stock_board_industry_name_em()
+            frame = run_with_timeout(
+                lambda: ak.stock_board_industry_name_em(),
+                self.board_timeout,
+                "AkShare stock_board_industry_name_em",
+            )
+        except ProviderTimeoutError as exc:
+            logger.warning(
+                "AkShare hot sectors timeout: provider_failed=true degraded=true "
+                "error=%s",
+                exc,
+            )
+            return set()
         except Exception as exc:
             logger.warning("AkShare hot sectors unavailable: %s", exc)
             return set()
@@ -185,9 +227,35 @@ class StrongStockScreener:
         Args:
             limit: 返回数量，默认 20。Sprint2 明确不返回 Top3。
         """
-        quotes = self.provider.get_realtime_quotes()
-        hot_sectors = self.provider.get_hot_sectors(limit=10)
-        index_change_pct = self.provider.get_index_change_pct()
+        try:
+            quotes = self.provider.get_realtime_quotes()
+        except Exception as exc:
+            logger.warning(
+                "Strong stock screener degraded: provider_failed=true "
+                "degraded=true stage=realtime_quotes error=%s",
+                exc,
+            )
+            return []
+
+        try:
+            hot_sectors = self.provider.get_hot_sectors(limit=10)
+        except Exception as exc:
+            logger.warning(
+                "Strong stock screener degraded: provider_failed=true "
+                "degraded=true stage=hot_sectors error=%s",
+                exc,
+            )
+            hot_sectors = set()
+
+        try:
+            index_change_pct = self.provider.get_index_change_pct()
+        except Exception as exc:
+            logger.warning(
+                "Strong stock screener degraded: provider_failed=true "
+                "degraded=true stage=index_change error=%s",
+                exc,
+            )
+            index_change_pct = 0.0
         industry_changes = _industry_change_map(quotes)
 
         candidates: list[StockCandidate] = []

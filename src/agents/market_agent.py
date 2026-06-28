@@ -76,6 +76,7 @@ INVESTMENT_RATING_RULES = """
 - 程序已直接渲染“📊 AI Investment Rating”。
 - AI 不得修改综合评级、当前评分、昨日评分、变化值或分项分数。
 - AI 只能解释为什么出现这些分数与风险，不能重新打分。
+- 如果板块显示“暂未纳入”，AI 不得自行补充板块分或编造行业/概念数据。
 """.strip()
 
 DEBUG_QUOTE_PATTERN = re.compile(r"^debug\s+quote\s+(.+)$", re.IGNORECASE)
@@ -576,7 +577,7 @@ class MarketAgent(BaseAgent):
         if not technical_valid:
             lines.append("技术指标状态：技术指标暂缺。")
         if not industry_valid:
-            lines.append("行业概念状态：行业概念暂缺。")
+            lines.append("行业概念状态：数据暂不可用，板块评分暂未纳入。")
 
         return "\n".join(lines), True, display_block
 
@@ -636,13 +637,13 @@ class MarketAgent(BaseAgent):
             default=None,
         )
         failure_reasons = self._stock_info_failure_reasons(stock_info)
-        name = self._value(stock_info, "name") or "未获取到可靠数据"
-        industry = self._value(stock_info, "industry") or "未获取到可靠数据"
+        name = self._value(stock_info, "name") or "数据暂不可用"
+        industry = self._value(stock_info, "industry") or "数据暂不可用"
         concepts = self._value(stock_info, "concepts") or []
         if isinstance(concepts, (list, tuple)) and concepts:
             concept_text = "、".join(str(item) for item in concepts if item)
         else:
-            concept_text = "未获取到可靠数据"
+            concept_text = "数据暂不可用"
 
         block = "\n".join([
             "【行业属性】",
@@ -720,9 +721,9 @@ class MarketAgent(BaseAgent):
         return "\n".join([
             "【行业属性】",
             f"股票代码：{symbol}",
-            "股票名称：未获取到可靠数据",
-            "所属行业：未获取到可靠数据",
-            "所属概念：未获取到可靠数据",
+            "股票名称：数据暂不可用",
+            "所属行业：数据暂不可用",
+            "所属概念：数据暂不可用",
         ])
 
     @staticmethod
@@ -755,6 +756,16 @@ class MarketAgent(BaseAgent):
             change_text = f"{rating.change_direction} {sign}{rating.score_change:.0f}"
         reasons = rating.change_reasons or ["暂无显著变化原因。"]
         reason_lines = [f"✓ {reason}" for reason in reasons[:3]]
+        sector_status = str(rating.reserved.get("sector_status") or "").strip()
+        if not sector_status:
+            sector_status = "暂未纳入" if rating.sector_score is None else "已纳入"
+        sector_line = f"板块：{sector_status}"
+        sector_notice = (
+            ["提示：板块评分暂未纳入。"]
+            if rating.sector_score is None
+            else []
+        )
+        quality_line = f"数据质量：{rating.data_quality.summary}"
         return "\n".join([
             "📊 AI Investment Rating",
             f"综合评级：{rating.rating_level.value}",
@@ -763,9 +774,11 @@ class MarketAgent(BaseAgent):
             f"变化：{change_text}",
             f"趋势：{rating.trend_score:.0f}",
             f"量价：{rating.volume_score:.0f}",
-            f"板块：{rating.sector_score:.0f}",
+            sector_line,
             f"K线：{rating.breakout_score:.0f}",
             f"强度：{rating.strength_score:.0f}",
+            quality_line,
+            *sector_notice,
             "原因：",
             *reason_lines,
             f"说明：{rating.warning}",
@@ -805,6 +818,12 @@ class MarketAgent(BaseAgent):
         name = quote_name or stock.name or stock.symbol
         concepts = self._extract_block_value(industry_block, "所属概念")
         industry = self._extract_block_value(industry_block, "所属行业")
+        industry_text = (
+            industry if industry and industry != "未获取到可靠数据" else "数据暂不可用"
+        )
+        concepts_text = (
+            concepts if concepts and concepts != "未获取到可靠数据" else "数据暂不可用"
+        )
         ma5 = self._extract_named_indicator(technical_block, "MA5")
         ma20 = self._extract_named_indicator(technical_block, "MA20")
         macd = self._extract_named_indicator(technical_block, "MACD")
@@ -818,8 +837,8 @@ class MarketAgent(BaseAgent):
             f"当前价：{self._format_price(self._quote_value(quote, 'price')) if quote_valid else '实时行情暂缺'}",
             f"涨跌幅：{self._format_pct(self._quote_value(quote, 'change_pct')) if quote_valid else '实时行情暂缺'}",
             f"成交额：{self._format_amount(self._quote_value(quote, 'amount')) if quote_valid else '实时行情暂缺'}",
-            f"行业：{industry if industry_valid else '行业概念暂缺'}",
-            f"概念：{concepts if industry_valid else '行业概念暂缺'}",
+            f"行业：{industry_text}",
+            f"概念：{concepts_text}",
             (
                 f"MA5/MA20：MA5={ma5}，MA20={ma20}"
                 if technical_valid

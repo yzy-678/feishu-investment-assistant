@@ -5,12 +5,13 @@ from datetime import date
 from src.db import get_database, init_database
 from src.market.akshare_source import HistoryBar, StockInfo
 from src.market.service import QuoteSnapshot
+from src.providers import ProviderResult, ProviderStatus
 from src.rating.rating_engine import (
     InvestmentRatingEngine,
     RATING_DATA_SCOPE_WARNING,
     rating_level,
 )
-from src.rating.rating_models import RatingInputData, RatingLevel
+from src.rating.rating_models import RatingInputData, RatingLevel, ScoreBreakdown
 from src.rating.rating_rules import (
     calculate_breakout_score,
     calculate_sector_score,
@@ -19,6 +20,12 @@ from src.rating.rating_rules import (
     calculate_volume_score,
 )
 from src.rating.score_calculator import InvestmentScoreCalculator
+from src.rating.sector_provider import (
+    EastMoneyRawSectorSource,
+    SectorContext,
+    SectorProvider,
+    to_eastmoney_security_code,
+)
 
 
 class FakeMarketData:
@@ -49,6 +56,64 @@ class FakeMarketData:
 
     def get_index_quotes(self, market="CN"):
         return self.index_quotes
+
+
+class FakeStockInfoProvider:
+    def __init__(self, stock_info=None, error=None):
+        self.stock_info = stock_info
+        self.error = error
+        self.calls = 0
+
+    def get_stock_info(self, symbol):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.stock_info
+
+
+class FakeHTTPResponse:
+    def __init__(self, payload, status_code=200):
+        self.payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self.payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class FakeHTTPClient:
+    def __init__(self, stock_payload=None, hot_payload=None, error=None):
+        self.stock_payload = stock_payload or {"data": {}}
+        self.hot_payload = hot_payload or {"data": []}
+        self.error = error
+        self.get_calls = []
+        self.post_calls = []
+
+    def get(self, url, params=None):
+        self.get_calls.append((url, params or {}))
+        if self.error is not None:
+            raise self.error
+        return FakeHTTPResponse(self.stock_payload)
+
+    def post(self, url, json=None):
+        self.post_calls.append((url, json or {}))
+        if self.error is not None:
+            raise self.error
+        return FakeHTTPResponse(self.hot_payload)
+
+
+class FakeSectorContextProvider:
+    def __init__(self, context=None, error=None):
+        self.context = context or SectorContext()
+        self.error = error
+
+    def get_sector_context(self, symbol):
+        if self.error is not None:
+            raise self.error
+        return self.context
 
 
 def make_bar(
@@ -159,12 +224,230 @@ def test_sector_score_uses_supplied_market_context_without_ai():
             sector_continuity_score=100,
             is_main_sector=True,
             sector_linkage_score=100,
+            sector_available=True,
         )
     )
 
     assert score == 20
     assert warnings == []
     assert any("市场主线" in item for item in evidence)
+
+
+def test_sector_score_is_none_when_sector_context_missing():
+    score, evidence, warnings = calculate_sector_score(
+        RatingInputData(symbol="300001", quote=make_quote())
+    )
+
+    assert score is None
+    assert evidence == []
+    assert any("板块评分暂未纳入" in item for item in warnings)
+
+
+def test_dynamic_weight_excludes_missing_sector_score():
+    breakdown = ScoreBreakdown(
+        trend_score=20,
+        volume_score=20,
+        sector_score=None,
+        breakout_score=20,
+        strength_score=20,
+    )
+
+    assert breakdown.total_score == 100
+
+
+def test_eastmoney_raw_sector_source_parses_f127_industry():
+    client = FakeHTTPClient(
+        stock_payload={
+            "data": {
+                "f58": "信维通信",
+                "f127": "消费电子",
+                "f128": "广东板块",
+            }
+        },
+        hot_payload={"data": []},
+    )
+
+    context = EastMoneyRawSectorSource(client=client).get_sector_context("300136")
+
+    assert context.name == "信维通信"
+    assert context.industry == "消费电子"
+    assert context.region_sector == "广东板块"
+    assert context.available is True
+
+
+def test_eastmoney_raw_sector_source_does_not_treat_f128_as_concept():
+    client = FakeHTTPClient(
+        stock_payload={
+            "data": {
+                "f58": "信维通信",
+                "f127": "消费电子",
+                "f128": "广东板块",
+            }
+        },
+        hot_payload={"data": []},
+    )
+
+    context = EastMoneyRawSectorSource(client=client).get_sector_context("300136")
+
+    assert context.region_sector == "广东板块"
+    assert context.concepts == []
+
+
+def test_bare_symbol_converts_to_eastmoney_prefixed_code():
+    assert to_eastmoney_security_code("000001") == "SZ000001"
+    assert to_eastmoney_security_code("300136") == "SZ300136"
+    assert to_eastmoney_security_code("002594") == "SZ002594"
+    assert to_eastmoney_security_code("003816") == "SZ003816"
+    assert to_eastmoney_security_code("600519") == "SH600519"
+    assert to_eastmoney_security_code("601318") == "SH601318"
+    assert to_eastmoney_security_code("603777") == "SH603777"
+    assert to_eastmoney_security_code("688981") == "SH688981"
+
+
+def test_eastmoney_raw_sector_source_uses_prefixed_code_for_concepts():
+    client = FakeHTTPClient(
+        stock_payload={"data": {}},
+        hot_payload={
+            "data": [
+                {"conceptName": "商业航天"},
+                {"conceptName": "华为概念"},
+            ]
+        },
+    )
+
+    context = EastMoneyRawSectorSource(client=client).get_sector_context("300136")
+
+    assert context.industry == ""
+    assert context.concepts == ["商业航天", "华为概念"]
+    assert client.post_calls[0][1]["srcSecurityCode"] == "SZ300136"
+
+
+def test_sector_provider_uses_fallback_after_industry_fetch_failure():
+    akshare = FakeStockInfoProvider(
+        stock_info=StockInfo(
+            symbol="300001",
+            name="测试科技",
+            industry="",
+            concepts=["AI硬件"],
+        )
+    )
+    eastmoney = FakeStockInfoProvider(
+        stock_info=StockInfo(
+            symbol="300001",
+            name="测试科技",
+            industry="半导体",
+            concepts=["AI硬件"],
+        )
+    )
+
+    context = SectorProvider(
+        akshare_provider=akshare,
+        eastmoney_provider=eastmoney,
+    ).get_sector_context("300001")
+
+    assert context.available is True
+    assert context.industry == "半导体"
+    assert context.concepts == ["AI硬件"]
+    assert "EastMoney" in context.data_source
+    assert akshare.calls == 1
+    assert eastmoney.calls == 1
+
+
+def test_sector_provider_returns_unavailable_when_concepts_fetch_failure():
+    akshare = FakeStockInfoProvider(
+        stock_info=StockInfo(
+            symbol="300001",
+            name="测试科技",
+            industry="半导体",
+            concepts=[],
+        )
+    )
+
+    context = SectorProvider(akshare_provider=akshare).get_sector_context("300001")
+
+    assert context.available is True
+    assert context.industry == "半导体"
+    assert context.concepts == []
+    assert context.sector_status == "部分纳入"
+    assert "板块评分部分纳入" in context.warning
+
+
+def test_sector_provider_available_when_only_concepts_exist():
+    akshare = FakeStockInfoProvider(
+        stock_info=StockInfo(
+            symbol="300001",
+            name="测试科技",
+            industry="",
+            concepts=["AI硬件"],
+        )
+    )
+
+    context = SectorProvider(akshare_provider=akshare).get_sector_context("300001")
+
+    assert context.available is True
+    assert context.industry == ""
+    assert context.concepts == ["AI硬件"]
+    assert context.sector_status == "部分纳入"
+
+
+def test_sector_provider_unavailable_only_when_industry_and_concepts_missing():
+    akshare = FakeStockInfoProvider(
+        stock_info=StockInfo(
+            symbol="300001",
+            name="测试科技",
+            industry="",
+            concepts=[],
+        )
+    )
+
+    context = SectorProvider(akshare_provider=akshare).get_sector_context("300001")
+
+    assert context.available is False
+    assert context.sector_status == "暂未纳入"
+    assert "板块评分暂未纳入" in context.warning
+
+
+def test_sector_score_supports_partial_weight():
+    score, evidence, warnings = calculate_sector_score(
+        RatingInputData(
+            symbol="300001",
+            industry_available=True,
+            concepts_available=False,
+            industry_score=10,
+            concept_score=None,
+            sector_available=True,
+        )
+    )
+
+    assert score == 10
+    assert any("行业数据可用" in item for item in evidence)
+    assert any("概念数据暂不可用" in item for item in warnings)
+
+
+def test_sector_http_error_is_logged_but_not_shown_to_user():
+    market_data = FakeMarketData(
+        quote=make_quote(),
+        history=trend_history(25),
+        stock_info=StockInfo(
+            symbol="300001",
+            name="测试科技",
+            industry="半导体",
+            concepts=[],
+        ),
+        index_quotes=[],
+    )
+
+    rating = InvestmentRatingEngine(
+        market_data=market_data,
+        sector_provider=FakeSectorContextProvider(
+            error=RuntimeError("HTTP 500 upstream detail")
+        ),
+        persist_history=False,
+    ).evaluate("300001")
+
+    assert "板块评分暂未纳入" in rating.warning
+    assert "HTTP 500" not in rating.warning
+    assert "upstream detail" not in rating.warning
 
 
 def test_breakout_score_is_rule_based_and_explainable():
@@ -205,6 +488,7 @@ def test_score_calculator_preserves_future_extension_slots():
         sector_continuity_score=100,
         is_main_sector=True,
         sector_linkage_score=100,
+        sector_available=True,
         industry_change_pct=2.0,
     )
 
@@ -235,11 +519,21 @@ def test_rating_engine_evaluate_returns_unified_investment_rating():
 
     rating = InvestmentRatingEngine(
         market_data=market_data,
+        sector_provider=FakeSectorContextProvider(
+            context=SectorContext(
+                industry="半导体",
+                concepts=["AI硬件"],
+                data_source="TestSector",
+                industry_score=10,
+                concept_score=10,
+            )
+        ),
         persist_history=False,
     ).evaluate("300001")
 
     assert rating.symbol == "300001"
     assert rating.name == "测试科技"
+    assert rating.sector_score == 20
     assert rating.total_score == (
         rating.trend_score
         + rating.volume_score
@@ -253,8 +547,10 @@ def test_rating_engine_evaluate_returns_unified_investment_rating():
     assert rating.change_direction == "new"
     assert rating.change_reasons == ["首次评级，暂无昨日评分对比。"]
     assert RATING_DATA_SCOPE_WARNING in rating.warning
-    assert rating.data_source == "EastMoney, AkShare"
+    assert rating.data_source == "EastMoney, AkShare, TestSector"
     assert "evidence" in rating.reserved
+    assert "data_quality" in rating.reserved
+    assert rating.data_quality.summary == "数据质量正常"
     assert "future_extensions" in rating.reserved
 
 
@@ -268,6 +564,7 @@ def test_rating_engine_handles_missing_data_without_inventing_scores():
 
     rating = InvestmentRatingEngine(
         market_data=market_data,
+        sector_provider=FakeSectorContextProvider(context=SectorContext()),
         persist_history=False,
     ).evaluate("300001")
 
@@ -276,6 +573,41 @@ def test_rating_engine_handles_missing_data_without_inventing_scores():
     assert rating.name == "300001"
     assert "不可用" in rating.warning or "不足" in rating.warning
     assert rating.data_source == "数据不足"
+    assert "实时行情" in rating.data_quality.missing_dimensions
+    assert "历史K线" in rating.data_quality.missing_dimensions
+    assert "板块评分" in rating.data_quality.missing_dimensions
+
+
+def test_rating_engine_records_cache_and_fallback_quality():
+    market_data = FakeMarketData(
+        quote=make_quote(),
+        history=[],
+        stock_info=StockInfo(symbol="300001", name="测试科技", industry="半导体"),
+        index_quotes=[],
+    )
+    kline_provider = FakeSectorContextProvider()
+    kline_provider.get_history = lambda symbol, period=60: ProviderResult(
+        status=ProviderStatus.CACHE,
+        source="EastMoney",
+        data=trend_history(25),
+        metadata={
+            "cache_hit": True,
+            "fallback": True,
+            "source_status": "success",
+        },
+    )
+
+    rating = InvestmentRatingEngine(
+        market_data=market_data,
+        kline_provider=kline_provider,
+        sector_provider=FakeSectorContextProvider(context=SectorContext()),
+        persist_history=False,
+    ).evaluate("300001")
+
+    assert rating.data_quality.has_cache is True
+    assert rating.data_quality.has_fallback is True
+    assert "使用缓存" in rating.data_quality.summary
+    assert "使用fallback" in rating.data_quality.summary
 
 
 def test_rating_engine_persists_history_and_reports_score_change(monkeypatch):

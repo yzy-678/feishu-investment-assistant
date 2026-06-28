@@ -1,10 +1,11 @@
 """StrongStockScreener tests."""
 
+import time
 from types import SimpleNamespace
 
 import pytest
 
-from src.market.akshare_source import HistoryBar
+from src.market.akshare_source import AkShareError, HistoryBar
 from src.market.stock_screener import (
     AkShareProvider,
     RealtimeQuote,
@@ -213,6 +214,30 @@ def test_screen_top_stocks_handles_missing_history():
     assert result[0].sector_score == 0.0
     assert result[0].score == 0.0
     assert "数据不足" in result[0].reason
+
+
+def test_screen_top_stocks_degrades_when_realtime_quotes_unavailable():
+    provider = FakeProvider([], {})
+    provider.get_realtime_quotes = lambda: (_ for _ in ()).throw(
+        RuntimeError("provider timeout")
+    )
+    screener = StrongStockScreener(provider=provider)
+
+    assert screener.screen_top_stocks() == []
+
+
+def test_akshare_provider_realtime_quotes_times_out_quickly():
+    def slow_spot():
+        time.sleep(0.2)
+        return FakeFrame([])
+
+    provider = AkShareProvider(
+        ak_module=SimpleNamespace(stock_zh_a_spot_em=slow_spot),
+        full_market_timeout=0.01,
+    )
+
+    with pytest.raises(AkShareError, match="超时"):
+        provider.get_realtime_quotes()
 
 
 def test_akshare_provider_parses_realtime_quotes_and_history():

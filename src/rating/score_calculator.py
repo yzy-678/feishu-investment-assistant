@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 from src.rating.rating_models import RatingInputData, ScoreBreakdown
 from src.rating.rating_rules import (
     calculate_breakout_score,
@@ -59,6 +61,8 @@ class InvestmentScoreCalculator:
             sector_score=sector_score,
             breakout_score=breakout_score,
             strength_score=strength_score,
+            industry_score=data.industry_score,
+            concept_score=data.concept_score,
             summary_parts=[part for part in summary_parts if part],
             warnings=warnings,
             evidence=evidence,
@@ -67,9 +71,11 @@ class InvestmentScoreCalculator:
 
 def _main_signal(
     label: str,
-    score: float,
+    score: Optional[float],
     evidence: list[str],
 ) -> str:
+    if score is None:
+        return f"{label}评分暂未纳入，数据暂不可用"
     if not evidence:
         return f"{label}{score:.1f}分，数据不足或信号不明显"
     return f"{label}{score:.1f}分：{evidence[0]}"

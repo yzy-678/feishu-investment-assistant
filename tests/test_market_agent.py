@@ -31,7 +31,7 @@ from src.market import (
     QuoteSnapshot,
     StockInfo,
 )
-from src.rating import InvestmentRating, RatingLevel
+from src.rating import DataQualityItem, DataQualityReport, InvestmentRating, RatingLevel
 
 
 # ── 辅助: 创建测试用自选股 ─────────────────────────────
@@ -345,6 +345,95 @@ class TestHandle:
         assert "⚠ 风险提示" in resp.message
         assert "AI 只负责解读" in resp.message
         mock_deps["rating_engine"].evaluate.assert_called_with("000001")
+
+    def test_rating_block_displays_missing_sector_as_not_included(self):
+        rating = InvestmentRating(
+            symbol="000001",
+            name="平安银行",
+            total_score=88,
+            rating_level=RatingLevel.A,
+            trend_score=18,
+            volume_score=17,
+            sector_score=None,
+            breakout_score=17,
+            strength_score=18,
+            previous_score=84,
+            score_change=4,
+            change_direction="⬆",
+            change_reasons=["放量突破平台。"],
+            summary="趋势较强",
+            warning="板块评分暂未纳入。当前评级仅基于已接入数据。",
+            timestamp="2026-06-22 10:00:00",
+            data_source="EastMoney, AkShare",
+        )
+
+        block = MarketAgent._format_rating_block(rating)
+
+        assert "板块：暂未纳入" in block
+        assert "提示：板块评分暂未纳入。" in block
+
+    def test_rating_block_displays_partial_sector_as_partially_included(self):
+        rating = InvestmentRating(
+            symbol="000001",
+            name="平安银行",
+            total_score=88,
+            rating_level=RatingLevel.A,
+            trend_score=18,
+            volume_score=17,
+            sector_score=10,
+            breakout_score=17,
+            strength_score=18,
+            previous_score=84,
+            score_change=4,
+            change_direction="⬆",
+            change_reasons=["行业数据可用。"],
+            summary="趋势较强",
+            warning="概念数据暂不可用，板块评分部分纳入。",
+            timestamp="2026-06-22 10:00:00",
+            data_source="EastMoneyRaw",
+            reserved={"sector_status": "部分纳入"},
+        )
+
+        block = MarketAgent._format_rating_block(rating)
+
+        assert "板块：部分纳入" in block
+        assert "提示：板块评分暂未纳入。" not in block
+
+    def test_rating_block_displays_data_quality_summary(self):
+        rating = InvestmentRating(
+            symbol="000001",
+            name="平安银行",
+            total_score=88,
+            rating_level=RatingLevel.A,
+            trend_score=18,
+            volume_score=17,
+            sector_score=10,
+            breakout_score=17,
+            strength_score=18,
+            previous_score=84,
+            score_change=4,
+            change_direction="⬆",
+            change_reasons=["行业数据可用。"],
+            summary="趋势较强",
+            warning="当前评级仅基于已接入数据。",
+            timestamp="2026-06-22 10:00:00",
+            data_source="EastMoney",
+            data_quality=DataQualityReport(
+                items=[
+                    DataQualityItem(
+                        name="历史K线",
+                        source="EastMoney",
+                        status="cache",
+                        cache_hit=True,
+                    )
+                ],
+                missing_dimensions=["板块评分"],
+            ),
+        )
+
+        block = MarketAgent._format_rating_block(rating)
+
+        assert "数据质量：使用缓存；未纳入：板块评分" in block
 
     def test_handle_removes_llm_generated_quote_lines(self, mock_deps):
         """最终回复不得保留 LLM 生成/篡改的行情字段"""
@@ -834,8 +923,25 @@ class TestAnalyzeStock:
         result = mock_deps["agent"].analyze_stock("000001")
 
         assert result.startswith("【数据卡片】")
-        assert "技术指标暂缺" in result or "行业概念暂缺" in result
+        assert "技术指标暂缺" in result or "数据暂不可用" in result
         mock_deps["deepseek"].chat.assert_called_once()
+
+    def test_stock_analysis_displays_industry_and_missing_concepts_separately(
+        self,
+        mock_deps,
+    ):
+        mock_deps["market_data"].get_stock_info.return_value = StockInfo(
+            symbol="000001",
+            name="平安银行",
+            industry="银行",
+            concepts=[],
+        )
+
+        result = mock_deps["agent"].analyze_stock("000001")
+
+        assert "行业：银行" in result
+        assert "概念：数据暂不可用" in result
+        assert "行业概念暂缺" not in result
 
     def test_akshare_exception_stops_stock_analysis(self, mock_deps):
         """AkShare 超时/异常时，EastMoney 可用则不阻断分析。"""

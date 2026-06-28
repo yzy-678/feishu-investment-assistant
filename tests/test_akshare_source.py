@@ -4,6 +4,7 @@
 """
 
 import logging
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -117,6 +118,19 @@ class TestAkShareHistory:
         logs = "\n".join(record.getMessage() for record in caplog.records)
         assert "AkShare failed: function=stock_zh_a_hist symbol=300136" in logs
         assert "akshare unavailable" in logs
+
+    def test_get_history_times_out_quickly(self):
+        def slow_history(**kwargs):
+            time.sleep(0.2)
+            return FakeFrame(make_history_records(1))
+
+        source = AkShareSource(
+            ak_module=SimpleNamespace(stock_zh_a_hist=slow_history),
+            timeout=0.01,
+        )
+
+        with pytest.raises(AkShareError, match="超时"):
+            source.get_history("300136")
 
 
 class TestAkShareIndicators:

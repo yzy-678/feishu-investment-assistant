@@ -85,11 +85,48 @@ def calculate_volume_score(data: RatingInputData) -> tuple[float, list[str], lis
     return min(score, 20.0), evidence, warnings
 
 
-def calculate_sector_score(data: RatingInputData) -> tuple[float, list[str], list[str]]:
+def calculate_sector_score(
+    data: RatingInputData,
+) -> tuple[Optional[float], list[str], list[str]]:
     """板块 20 分：热度、持续性、主线、联动。"""
     evidence: list[str] = []
     warnings: list[str] = []
     score = 0.0
+    if not data.sector_available:
+        return None, evidence, ["板块评分暂未纳入：行业/概念或板块统计数据暂不可用"]
+
+    split_score_available = (
+        data.industry_available
+        or data.concepts_available
+        or data.industry_score is not None
+        or data.concept_score is not None
+    )
+    legacy_score_available = any(
+        item is not None
+        for item in (
+            data.sector_heat_score,
+            data.sector_continuity_score,
+            data.is_main_sector,
+            data.sector_linkage_score,
+            data.industry_change_pct,
+        )
+    )
+    if split_score_available and not legacy_score_available:
+        if data.industry_available or data.industry_score is not None:
+            points = min(10.0, max(0.0, data.industry_score or 10.0))
+            score += points
+            evidence.append(f"行业数据可用，板块行业维度 +{points:.1f}")
+        else:
+            warnings.append("行业数据暂不可用")
+
+        if data.concepts_available or data.concept_score is not None:
+            points = min(10.0, max(0.0, data.concept_score or 10.0))
+            score += points
+            evidence.append(f"概念数据可用，板块概念维度 +{points:.1f}")
+        else:
+            warnings.append("概念数据暂不可用")
+
+        return round(min(score, 20.0), 2), evidence, warnings
 
     if data.sector_heat_score is None:
         warnings.append("板块热度数据不足")
