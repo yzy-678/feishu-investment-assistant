@@ -28,6 +28,7 @@ from src.market import (
 )
 from src.bot.text_utils import sanitize_text
 from src.memory import ConversationMemory, get_memory
+from src.rating import InvestmentRating, get_rating_engine
 from src.watchlist.manager import WatchlistManager, WatchlistError, get_watchlist
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,13 @@ TECHNICAL_ANALYSIS_RULES = """
 - AI 不编造指标。
 - AI 只能解释程序在【技术分析】中提供的近60日趋势、MA5、MA10、MA20、MA60、DIF、DEA、MACD。
 - 如果某项显示“未获取到可靠数据”，不得基于该项做判断。
+""".strip()
+
+INVESTMENT_RATING_RULES = """
+评级硬规则：
+- 程序已直接渲染“📊 AI Investment Rating”。
+- AI 不得修改综合评级、当前评分、昨日评分、变化值或分项分数。
+- AI 只能解释为什么出现这些分数与风险，不能重新打分。
 """.strip()
 
 DEBUG_QUOTE_PATTERN = re.compile(r"^debug\s+quote\s+(.+)$", re.IGNORECASE)
@@ -112,6 +120,7 @@ class MarketAgent(BaseAgent):
         self.config: ConfigManager = get_config()
         self.market_data = get_market_data_service()
         self.stock_resolver: StockResolver = get_stock_resolver()
+        self.rating_engine = get_rating_engine()
         self._initialized = True
         logger.info("MarketAgent initialized")
 
@@ -464,9 +473,11 @@ class MarketAgent(BaseAgent):
                     block,
                     self._build_unavailable_technical_block(),
                     self._build_unavailable_industry_block(symbol),
+                    self._build_unavailable_rating_block(symbol),
                     "行情状态：当前仍在使用 mock 数据源。",
                     REALTIME_QUOTE_RULES,
                     TECHNICAL_ANALYSIS_RULES,
+                    INVESTMENT_RATING_RULES,
                 ]),
                 False,
                 display_block,
@@ -535,6 +546,8 @@ class MarketAgent(BaseAgent):
             industry_block=industry_block,
             industry_valid=industry_valid,
         )
+        rating_block = self._build_rating_block(symbol)
+        display_block = "\n".join([display_block, rating_block])
         self._log_prompt_quote_data(
             symbol=symbol,
             quote_block=display_block,
@@ -547,8 +560,10 @@ class MarketAgent(BaseAgent):
             quote_block,
             technical_block,
             industry_block,
+            rating_block,
             REALTIME_QUOTE_RULES,
             TECHNICAL_ANALYSIS_RULES,
+            INVESTMENT_RATING_RULES,
             self._build_stock_reply_format_rules(),
         ]
 
@@ -637,6 +652,14 @@ class MarketAgent(BaseAgent):
         ])
         return block, not failure_reasons, ";".join(failure_reasons)
 
+    def _build_rating_block(self, symbol: str) -> str:
+        try:
+            rating = self.rating_engine.evaluate(symbol)
+        except Exception as exc:
+            logger.warning("Investment rating unavailable for %s: %s", symbol, exc)
+            return self._build_unavailable_rating_block(symbol)
+        return self._format_rating_block(rating)
+
     def _technical_failure_reasons(self, history: Any, ma: Any, macd: Any) -> list[str]:
         reasons: list[str] = []
         bars = list(history or [])
@@ -700,6 +723,52 @@ class MarketAgent(BaseAgent):
             "股票名称：未获取到可靠数据",
             "所属行业：未获取到可靠数据",
             "所属概念：未获取到可靠数据",
+        ])
+
+    @staticmethod
+    def _build_unavailable_rating_block(symbol: str) -> str:
+        return "\n".join([
+            "📊 AI Investment Rating",
+            f"股票代码：{symbol}",
+            "综合评级：评级暂不可用",
+            "当前评分：评级暂不可用",
+            "昨日评分：评级暂不可用",
+            "变化：评级暂不可用",
+            "趋势：评级暂不可用",
+            "量价：评级暂不可用",
+            "板块：评级暂不可用",
+            "K线：评级暂不可用",
+            "强度：评级暂不可用",
+        ])
+
+    @staticmethod
+    def _format_rating_block(rating: InvestmentRating) -> str:
+        previous_score = (
+            f"{rating.previous_score:.0f}"
+            if rating.previous_score is not None
+            else "暂无历史评分"
+        )
+        if rating.score_change is None:
+            change_text = "首次评级"
+        else:
+            sign = "+" if rating.score_change > 0 else ""
+            change_text = f"{rating.change_direction} {sign}{rating.score_change:.0f}"
+        reasons = rating.change_reasons or ["暂无显著变化原因。"]
+        reason_lines = [f"✓ {reason}" for reason in reasons[:3]]
+        return "\n".join([
+            "📊 AI Investment Rating",
+            f"综合评级：{rating.rating_level.value}",
+            f"当前评分：{rating.total_score:.0f} /100",
+            f"昨日评分：{previous_score}",
+            f"变化：{change_text}",
+            f"趋势：{rating.trend_score:.0f}",
+            f"量价：{rating.volume_score:.0f}",
+            f"板块：{rating.sector_score:.0f}",
+            f"K线：{rating.breakout_score:.0f}",
+            f"强度：{rating.strength_score:.0f}",
+            "原因：",
+            *reason_lines,
+            f"说明：{rating.warning}",
         ])
 
     @staticmethod
@@ -791,6 +860,7 @@ class MarketAgent(BaseAgent):
             "- 你只输出以下两部分：",
             "🧠 AI综合判断",
             "⚠ 风险提示",
+            "- 可以解释“📊 AI Investment Rating”的分数来源，但不得修改任何分数。",
         ])
 
     def _safe_market_data_call(

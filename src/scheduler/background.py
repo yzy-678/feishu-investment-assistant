@@ -1,58 +1,34 @@
 """
 FastAPI 后台调度器
 
-使用 APScheduler 在 Railway 常驻进程中自动推送每日报告：
+使用 APScheduler 在 Railway 常驻进程中自动推送每日早报：
 - 08:30 早报
-- 12:00 午间观察
-- 15:30 收盘复盘
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from src.agents.report_agent import get_report_agent
-from src.bot.client import get_feishu_client
 from src.config.settings import settings
+from src.reports.morning_report_service import get_morning_report_service
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class DailyReportJob:
-    """每日自动报告任务配置。"""
+class MorningReportJob:
+    """每日早报任务配置。"""
 
-    report_type: str
     hour: int
     minute: int
-    generator_name: str
 
 
-DAILY_REPORT_JOBS: tuple[DailyReportJob, ...] = (
-    DailyReportJob(
-        report_type="morning",
-        hour=8,
-        minute=30,
-        generator_name="generate_morning_report",
-    ),
-    DailyReportJob(
-        report_type="noon",
-        hour=12,
-        minute=0,
-        generator_name="generate_noon_report",
-    ),
-    DailyReportJob(
-        report_type="closing",
-        hour=15,
-        minute=30,
-        generator_name="generate_closing_report",
-    ),
-)
+MORNING_REPORT_JOB = MorningReportJob(hour=8, minute=30)
 
 _scheduler: Optional[AsyncIOScheduler] = None
 
@@ -87,7 +63,7 @@ def start_scheduler() -> None:
     logger.info(
         "Background scheduler started: timezone=%s jobs=%d",
         timezone.key,
-        len(DAILY_REPORT_JOBS),
+        1,
     )
 
 
@@ -104,37 +80,35 @@ def stop_scheduler() -> None:
     logger.info("Background scheduler stopped")
 
 
-def send_daily_report(report_type: str) -> bool:
-    """生成并推送单次日报。
-
-    Args:
-        report_type: morning / noon / closing
-
-    Returns:
-        True 表示已成功发送，False 表示跳过或失败。
-    """
+def send_morning_report() -> bool:
+    """生成并推送单次早报。"""
     if not settings.daily_report_enabled:
-        _log_report_send(report_type, "disabled")
-        return False
-
-    admin_open_id = settings.admin_user_open_id.strip()
-    if not admin_open_id:
-        _log_report_send(report_type, "skipped", "admin_user_open_id is empty")
+        _log_report_send("morning", "disabled")
         return False
 
     try:
-        report_text = _generate_report(report_type)
-        get_feishu_client().send_markdown(admin_open_id, report_text)
-        _log_report_send(report_type, "success")
-        return True
+        sent = get_morning_report_service().send()
+        if sent:
+            _log_report_send("morning", "success")
+        else:
+            _log_report_send("morning", "skipped", "admin_user_open_id is empty")
+        return sent
     except Exception as exc:
-        _log_report_send(report_type, "failed", str(exc))
+        _log_report_send("morning", "failed", str(exc))
         logger.exception(
             "Daily report send failed: report_type=%s error_message=%s",
-            report_type,
+            "morning",
             exc,
         )
         return False
+
+
+def send_daily_report(report_type: str = "morning") -> bool:
+    """Backward-compatible entrypoint for the Sprint1 morning report."""
+    if report_type != "morning":
+        _log_report_send(report_type, "skipped", "only morning report is enabled")
+        return False
+    return send_morning_report()
 
 
 def get_scheduler() -> Optional[AsyncIOScheduler]:
@@ -143,33 +117,17 @@ def get_scheduler() -> Optional[AsyncIOScheduler]:
 
 
 def _register_daily_report_jobs(scheduler: AsyncIOScheduler) -> None:
-    for job in DAILY_REPORT_JOBS:
-        scheduler.add_job(
-            send_daily_report,
-            "cron",
-            hour=job.hour,
-            minute=job.minute,
-            args=[job.report_type],
-            id=f"daily_report_{job.report_type}",
-            name=f"daily_report_{job.report_type}",
-            replace_existing=True,
-            coalesce=True,
-            max_instances=1,
-        )
-
-
-def _generate_report(report_type: str) -> str:
-    generators: dict[str, str] = {
-        job.report_type: job.generator_name
-        for job in DAILY_REPORT_JOBS
-    }
-    generator_name = generators.get(report_type)
-    if not generator_name:
-        raise ValueError(f"Unsupported report_type: {report_type}")
-
-    agent = get_report_agent()
-    generator: Callable[[], str] = getattr(agent, generator_name)
-    return generator()
+    scheduler.add_job(
+        send_morning_report,
+        "cron",
+        hour=MORNING_REPORT_JOB.hour,
+        minute=MORNING_REPORT_JOB.minute,
+        id="daily_report_morning",
+        name="daily_report_morning",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
 
 
 def _resolve_timezone(timezone_name: str) -> ZoneInfo:

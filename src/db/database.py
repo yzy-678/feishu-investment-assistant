@@ -156,6 +156,47 @@ class DatabaseManager:
                 ON alert_events(event_id);
             CREATE INDEX IF NOT EXISTS idx_alert_events_unresolved
                 ON alert_events(resolved, alert_type);
+
+            -- observation_pool：强势观察池连续跟踪
+            CREATE TABLE IF NOT EXISTS observation_pool (
+                symbol            TEXT PRIMARY KEY,
+                name              TEXT NOT NULL,
+                industry          TEXT DEFAULT '',
+                first_seen        TEXT NOT NULL,
+                last_seen         TEXT NOT NULL,
+                consecutive_days  INTEGER DEFAULT 1,
+                highest_score     REAL DEFAULT 0.0,
+                latest_score      REAL DEFAULT 0.0,
+                latest_rank       INTEGER DEFAULT 0,
+                latest_reason     TEXT DEFAULT '',
+                status            TEXT DEFAULT 'active'
+                                  CHECK(status IN ('active', 'dropped', 'watching'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_observation_pool_status
+                ON observation_pool(status, last_seen DESC);
+
+            -- investment_rating_history：投资评级每日快照
+            CREATE TABLE IF NOT EXISTS investment_rating_history (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol          TEXT NOT NULL,
+                rating_date     TEXT NOT NULL,
+                name            TEXT DEFAULT '',
+                total_score     REAL DEFAULT 0.0,
+                rating_level    TEXT DEFAULT 'D',
+                trend_score     REAL DEFAULT 0.0,
+                volume_score    REAL DEFAULT 0.0,
+                sector_score    REAL DEFAULT 0.0,
+                breakout_score  REAL DEFAULT 0.0,
+                strength_score  REAL DEFAULT 0.0,
+                summary         TEXT DEFAULT '',
+                warning         TEXT DEFAULT '',
+                data_source     TEXT DEFAULT '',
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, rating_date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_investment_rating_history_symbol_date
+                ON investment_rating_history(symbol, rating_date DESC);
         """)
         conn.commit()
 

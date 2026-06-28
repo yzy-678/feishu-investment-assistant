@@ -31,6 +31,7 @@ from src.market import (
     QuoteSnapshot,
     StockInfo,
 )
+from src.rating import InvestmentRating, RatingLevel
 
 
 # ── 辅助: 创建测试用自选股 ─────────────────────────────
@@ -67,6 +68,7 @@ def mock_deps():
         patch("src.agents.market_agent.get_watchlist") as mock_wl,
         patch("src.agents.market_agent.get_config") as mock_cfg,
         patch("src.agents.market_agent.get_market_data_service") as mock_mds,
+        patch("src.agents.market_agent.get_rating_engine") as mock_rating_engine,
         patch("src.agents.market_agent.settings.data_source", "eastmoney"),
     ):
         # DeepSeek mock
@@ -156,6 +158,36 @@ def mock_deps():
         )
         mock_mds.return_value = mock_mds_instance
 
+        rating = InvestmentRating(
+            symbol="000001",
+            name="平安银行",
+            total_score=88,
+            rating_level=RatingLevel.A,
+            trend_score=18,
+            volume_score=17,
+            sector_score=18,
+            breakout_score=17,
+            strength_score=18,
+            previous_score=84,
+            score_change=4,
+            change_direction="⬆",
+            change_reasons=[
+                "放量突破/结构改善，K线结构评分提升 +2.0。",
+                "板块热度或主线联动提升，板块评分提升 +1.0。",
+                "成交量/成交额或价升量增改善，量价评分提升 +1.0。",
+            ],
+            summary="趋势较强",
+            warning=(
+                "当前评级仅基于已接入的行情、技术和量价数据，"
+                "不包含未接入的新闻、公告、财报和资金流数据。"
+            ),
+            timestamp="2026-06-22 10:00:00",
+            data_source="EastMoney, AkShare",
+        )
+        mock_rating_engine_instance = MagicMock()
+        mock_rating_engine_instance.evaluate.return_value = rating
+        mock_rating_engine.return_value = mock_rating_engine_instance
+
         agent = MarketAgent()
         yield {
             "agent": agent,
@@ -164,6 +196,7 @@ def mock_deps():
             "watchlist": mock_wl_instance,
             "config": mock_cfg_instance,
             "market_data": mock_mds_instance,
+            "rating_engine": mock_rating_engine_instance,
         }
 
 
@@ -301,9 +334,17 @@ class TestHandle:
         assert "MACD：0.0800" in resp.message
         assert "行业：银行" in resp.message
         assert "概念：互联金融、破净股" in resp.message
+        assert "📊 AI Investment Rating" in resp.message
+        assert "综合评级：A" in resp.message
+        assert "当前评分：88 /100" in resp.message
+        assert "昨日评分：84" in resp.message
+        assert "变化：⬆ +4" in resp.message
+        assert "✓ 放量突破/结构改善" in resp.message
+        assert "当前评级仅基于已接入的行情、技术和量价数据" in resp.message
         assert "🧠 AI综合判断" in resp.message
         assert "⚠ 风险提示" in resp.message
         assert "AI 只负责解读" in resp.message
+        mock_deps["rating_engine"].evaluate.assert_called_with("000001")
 
     def test_handle_removes_llm_generated_quote_lines(self, mock_deps):
         """最终回复不得保留 LLM 生成/篡改的行情字段"""

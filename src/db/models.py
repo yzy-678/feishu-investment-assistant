@@ -52,6 +52,13 @@ class SummaryType(str, Enum):
     CONVERSATION = "conversation"
     WEEKLY = "weekly"
     KEY_INSIGHT = "key_insight"
+
+
+class ObservationStatus(str, Enum):
+    """强势观察池状态"""
+    ACTIVE = "active"
+    DROPPED = "dropped"
+    WATCHING = "watching"
  
  
 # ═══════════════════════════════════════════════════════════
@@ -185,6 +192,31 @@ class AlertEvent(AlertEventCreate):
     resolved: int = Field(default=0, ge=0, le=1, description="是否已解除（0/1）")
     created_at: datetime = Field(..., description="创建时间")
  
+    model_config = {"from_attributes": True}
+
+
+# ═══════════════════════════════════════════════════════════
+#  Observation Pool
+# ═══════════════════════════════════════════════════════════
+
+
+class ObservationPoolEntry(BaseModel):
+    """强势观察池记录"""
+    symbol: str = Field(..., min_length=1, max_length=20, description="股票代码")
+    name: str = Field(..., max_length=50, description="股票名称")
+    industry: str = Field(default="", max_length=50, description="所属行业")
+    first_seen: str = Field(..., description="首次进入观察池日期")
+    last_seen: str = Field(..., description="最近进入 Top3 日期")
+    consecutive_days: int = Field(default=1, ge=0, description="连续上榜天数")
+    highest_score: float = Field(default=0.0, ge=0.0, description="历史最高评分")
+    latest_score: float = Field(default=0.0, ge=0.0, description="最新评分")
+    latest_rank: int = Field(default=0, ge=0, description="最新排名")
+    latest_reason: str = Field(default="", description="最新强势原因")
+    status: ObservationStatus = Field(
+        default=ObservationStatus.ACTIVE,
+        description="观察池状态",
+    )
+
     model_config = {"from_attributes": True}
  
  
