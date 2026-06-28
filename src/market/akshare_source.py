@@ -11,9 +11,12 @@ import importlib
 import logging
 from typing import Any, Optional
 
+import httpx
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+EASTMONEY_QUOTE_URL = "https://push2.eastmoney.com/api/qt/stock/get"
 
 
 class AkShareError(Exception):
@@ -127,8 +130,14 @@ class AkShareSource:
         """获取股票名称、行业、概念板块。"""
         self._log_request("stock_individual_info_em", symbol)
         try:
-            frame = self._akshare().stock_individual_info_em(symbol=symbol)
-            info = self._key_value_map(frame)
+            try:
+                frame = self._akshare().stock_individual_info_em(symbol=symbol)
+                info = self._key_value_map(frame)
+            except Exception as exc:
+                self._log_failed("stock_individual_info_em", symbol, exc)
+                self._log_request("stock_individual_info_em_fallback", symbol)
+                info = self._fetch_stock_info_fallback(symbol)
+
             concepts = self._parse_concepts(info)
             if not concepts:
                 concepts = self._fetch_hot_concepts(symbol)
@@ -181,6 +190,26 @@ class AkShareSource:
         except Exception as exc:
             self._log_failed("stock_hot_keyword_em", symbol, exc)
             return []
+
+    def _fetch_stock_info_fallback(self, symbol: str) -> dict[str, str]:
+        market_code = "1" if str(symbol).startswith("6") else "0"
+        response = httpx.get(
+            EASTMONEY_QUOTE_URL,
+            params={
+                "fltt": "2",
+                "invt": "2",
+                "fields": "f57,f58,f127",
+                "secid": f"{market_code}.{symbol}",
+            },
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        data = (response.json() or {}).get("data") or {}
+        return {
+            "股票代码": str(data.get("f57") or "").strip(),
+            "股票简称": str(data.get("f58") or "").strip(),
+            "行业": str(data.get("f127") or "").strip(),
+        }
 
     @staticmethod
     def _records(frame: Any, tail: Optional[int] = None) -> list[dict[str, Any]]:

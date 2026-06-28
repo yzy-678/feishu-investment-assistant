@@ -233,6 +233,32 @@ class TestStockInfo:
 
         assert result.concepts == []
 
+    def test_get_stock_info_falls_back_when_akshare_interface_breaks(self):
+        keyword_frame = FakeFrame([
+            {"概念名称": "商业航天"},
+            {"概念名称": "卫星导航"},
+        ])
+        source = AkShareSource(
+            ak_module=SimpleNamespace(
+                stock_individual_info_em=lambda **kwargs: (_ for _ in ()).throw(
+                    ValueError("Length mismatch")
+                ),
+                stock_hot_keyword_em=lambda **kwargs: keyword_frame,
+            )
+        )
+
+        source._fetch_stock_info_fallback = lambda symbol: {
+            "股票简称": "有研新材",
+            "行业": "小金属",
+        }
+
+        result = source.get_stock_info("600206")
+
+        assert result.symbol == "600206"
+        assert result.name == "有研新材"
+        assert result.industry == "小金属"
+        assert result.concepts == ["商业航天", "卫星导航"]
+
 
 class TestMarketDataServiceAkShareDelegation:
     def test_market_data_service_delegates_history_to_akshare(self):
