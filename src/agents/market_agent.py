@@ -45,6 +45,7 @@ _HANDLE_KEYWORDS: list[str] = [
 
 UNRELIABLE_QUOTE_MESSAGE = "未获取到可靠实时行情"
 STOCK_DATA_FAILURE_MESSAGE = "实时数据获取失败，暂时无法分析"
+STOCK_UNRECOGNIZED_MESSAGE = "未能识别股票，请输入股票代码，例如 600206。"
 
 REALTIME_QUOTE_RULES = """
 行情硬规则：
@@ -63,7 +64,8 @@ TECHNICAL_ANALYSIS_RULES = """
 - 如果某项显示“未获取到可靠数据”，不得基于该项做判断。
 """.strip()
 
-DEBUG_QUOTE_PATTERN = re.compile(r"^debug\s+quote\s+(\d{6})$", re.IGNORECASE)
+DEBUG_QUOTE_PATTERN = re.compile(r"^debug\s+quote\s+(.+)$", re.IGNORECASE)
+DEBUG_SLASH_PATTERN = re.compile(r"^/debug\s+(.+)$", re.IGNORECASE)
 
 
 class MarketAgent(BaseAgent):
@@ -102,14 +104,14 @@ class MarketAgent(BaseAgent):
         if not message or not message.strip():
             return False
         msg = message.strip()
-        if DEBUG_QUOTE_PATTERN.fullmatch(msg):
+        if DEBUG_QUOTE_PATTERN.fullmatch(msg) or DEBUG_SLASH_PATTERN.fullmatch(msg):
             return True
         if is_news_intent(msg):
             return False
         if any(kw in msg for kw in _HANDLE_KEYWORDS):
             return True
         if self._looks_like_stock_name_query(msg):
-            return bool(self.market_data.extract_symbol(msg))
+            return True
         return False
 
     def handle(self, session_id: str, message: str) -> AgentResponse:
@@ -120,27 +122,46 @@ class MarketAgent(BaseAgent):
         3. 返回结果或异常包装
         """
         try:
-            debug_match = DEBUG_QUOTE_PATTERN.fullmatch(message.strip())
+            stripped_message = message.strip()
+            debug_match = (
+                DEBUG_QUOTE_PATTERN.fullmatch(stripped_message)
+                or DEBUG_SLASH_PATTERN.fullmatch(stripped_message)
+            )
             if debug_match:
                 return self._handle_debug_quote(
                     session_id,
                     debug_match.group(1),
                 )
 
+            if self._requires_stock_resolution(stripped_message):
+                symbol = self._extract_focus_symbol(stripped_message)
+                if not symbol:
+                    return AgentResponse(
+                        success=True,
+                        agent=AgentType.MARKET,
+                        message=STOCK_UNRECOGNIZED_MESSAGE,
+                        metadata={
+                            "session_id": session_id,
+                            "data_available": False,
+                            "reason": "symbol_unrecognized",
+                        },
+                    )
+
             # 1. 构建本轮增强上下文（不写入长期记忆，避免历史行情复活）
             market_context, reply_quote_block, stock_data_valid = (
                 self._build_market_context_parts(message)
             )
             if not stock_data_valid:
+                failure_message = self._build_stock_failure_message(market_context)
                 self._log_final_user_data(
                     session_id,
                     reply_quote_block,
-                    STOCK_DATA_FAILURE_MESSAGE,
+                    failure_message,
                 )
                 return AgentResponse(
                     success=True,
                     agent=AgentType.MARKET,
-                    message=STOCK_DATA_FAILURE_MESSAGE,
+                    message=failure_message,
                     metadata={
                         "session_id": session_id,
                         "data_available": False,
@@ -208,12 +229,13 @@ class MarketAgent(BaseAgent):
             market,
         )
         if not data_valid:
+            failure_message = self._build_stock_failure_message(data_context)
             self._log_final_user_data(
                 "analyze_stock",
                 quote_block,
-                STOCK_DATA_FAILURE_MESSAGE,
+                failure_message,
             )
-            return STOCK_DATA_FAILURE_MESSAGE
+            return failure_message
 
         analysis_points = self._build_stock_analysis_points(data_valid)
         prompt = (
@@ -813,6 +835,16 @@ class MarketAgent(BaseAgent):
             "禁止分析今日走势、当前强弱或盘中表现。"
         )
 
+    @staticmethod
+    def _build_stock_failure_message(context: str) -> str:
+        if "AkShare 数据不完整" in context:
+            return f"{STOCK_DATA_FAILURE_MESSAGE}\n失败层级：AkShare\n错误信息：历史/技术/行业数据为空或字段缺失"
+        if "行情暂不可用" in context or "实时行情无效" in context:
+            return f"{STOCK_DATA_FAILURE_MESSAGE}\n失败层级：EastMoney\n错误信息：实时行情失败、为空、超时或字段缺失"
+        if "mock 数据源" in context:
+            return f"{STOCK_DATA_FAILURE_MESSAGE}\n失败层级：MarketDataService\n错误信息：未启用 EastMoney 实时行情源"
+        return f"{STOCK_DATA_FAILURE_MESSAGE}\n失败层级：MarketDataService\n错误信息：实时数据校验失败"
+
     def _is_quote_valid(self, quote: Any) -> bool:
         return (
             not self._missing_quote_fields(quote)
@@ -1145,13 +1177,13 @@ class MarketAgent(BaseAgent):
             missing_fields,
         )
 
-    def _handle_debug_quote(self, session_id: str, symbol: str) -> AgentResponse:
+    def _handle_debug_quote(self, session_id: str, raw_query: str) -> AgentResponse:
         admin_open_id = settings.admin_user_open_id.strip()
         if not admin_open_id or session_id.strip() != admin_open_id:
             logger.warning(
-                "Quote debug denied: session=%s symbol=%s",
+                "Quote debug denied: session=%s raw_query=%s",
                 session_id[:8],
-                symbol,
+                raw_query,
             )
             return AgentResponse(
                 success=False,
@@ -1160,23 +1192,33 @@ class MarketAgent(BaseAgent):
                 metadata={"type": "quote_debug", "authorized": False},
             )
 
+        raw_message = str(raw_query or "").strip()
+        cleaned_message = self._clean_debug_stock_query(raw_message)
+        symbol = self.market_data.extract_symbol(cleaned_message) or (
+            cleaned_message if re.fullmatch(r"\d{6}", cleaned_message) else ""
+        )
+        resolved_name = ""
+
         quote = None
-        fetch_failure_reason = ""
+        eastmoney_error = ""
         try:
-            quote = self.market_data.get_quote(symbol, market="CN")
+            if symbol:
+                quote = self.market_data.get_quote(symbol, market="CN")
+                resolved_name = str(self._quote_value(quote, "name") or "")
+            else:
+                eastmoney_error = "symbol_unrecognized"
         except MarketDataError as exc:
-            fetch_failure_reason = getattr(exc, "reason", "unknown")
+            eastmoney_error = f"{getattr(exc, 'reason', 'unknown')}: {exc}"
             logger.warning(
                 "Quote debug failed: symbol=%s reason=%s error=%s",
                 symbol,
-                fetch_failure_reason,
+                getattr(exc, "reason", "unknown"),
                 exc,
             )
 
         missing_fields = self._missing_quote_fields(quote)
-        failure_reason = fetch_failure_reason or self._quote_failure_reason(quote)
+        failure_reason = eastmoney_error or self._quote_failure_reason(quote)
         quote_valid = not missing_fields and not failure_reason
-        data_age_seconds = self._quote_value(quote, "data_age_seconds")
         self._log_quote_state(
             symbol,
             quote,
@@ -1189,22 +1231,94 @@ class MarketAgent(BaseAgent):
             quote_valid=quote_valid,
             failure_reason=failure_reason,
         )
+
+        stock_info = None
+        ma = None
+        macd = None
+        akshare_error = ""
+        if symbol:
+            try:
+                stock_info = self.market_data.get_stock_info(symbol)
+                ma = self.market_data.get_ma(symbol)
+                macd = self.market_data.get_macd(symbol)
+                if not resolved_name:
+                    resolved_name = str(self._value(stock_info, "name") or "")
+                akshare_failures = (
+                    self._stock_info_failure_reasons(stock_info)
+                    + self._technical_failure_reasons([], ma, macd)
+                )
+                akshare_failures = [
+                    item for item in akshare_failures if item != "history_empty"
+                ]
+                if akshare_failures:
+                    akshare_error = ",".join(akshare_failures)
+            except Exception as exc:
+                akshare_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "AkShare debug failed: symbol=%s error=%s",
+                    symbol,
+                    exc,
+                )
+        else:
+            akshare_error = "symbol_unrecognized"
+
+        concepts = self._value(stock_info, "concepts") or []
+        concept_text = (
+            "、".join(str(item) for item in concepts if item)
+            if isinstance(concepts, (list, tuple))
+            else ""
+        )
+        final_card = (
+            self._build_quote_block(quote, quote_valid)
+            if quote is not None
+            else self._build_invalid_quote_block()
+        )
+        logger.info(
+            "MarketAgent debug stock data: %s",
+            json.dumps(
+                {
+                    "raw_message": raw_message,
+                    "cleaned_message": cleaned_message,
+                    "resolved_symbol": symbol,
+                    "resolved_name": resolved_name,
+                    "eastmoney_status": not bool(eastmoney_error),
+                    "akshare_status": not bool(akshare_error),
+                    "quote_valid": quote_valid,
+                    "missing_fields": missing_fields,
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        )
+
         reply = "\n".join([
-            f"source: {self._quote_value(quote, 'source') or ''}",
-            f"timestamp: {self._quote_value(quote, 'timestamp') or ''}",
-            f"fetched_at: {self._quote_value(quote, 'fetched_at') or ''}",
-            (
-                "data_age_seconds: "
-                f"{data_age_seconds if data_age_seconds is not None else ''}"
-            ),
-            f"price: {self._quote_value(quote, 'price') if quote is not None else ''}",
-            (
-                "change_pct: "
-                f"{self._quote_value(quote, 'change_pct') if quote is not None else ''}"
-            ),
-            f"quote_valid: {str(quote_valid).lower()}",
-            f"failure_reason: {failure_reason}",
-            f"missing_fields: {missing_fields}",
+            "【Debug 股票解析】",
+            f"原始输入：{raw_message}",
+            f"清洗后输入：{cleaned_message}",
+            f"识别股票名称：{resolved_name}",
+            f"识别股票代码：{symbol}",
+            "",
+            "【EastMoney】",
+            f"是否成功：{'是' if not eastmoney_error and quote is not None else '否'}",
+            f"价格：{self._quote_value(quote, 'price') or ''}",
+            f"涨跌幅：{self._quote_value(quote, 'change_pct') or ''}",
+            f"数据时间：{self._quote_value(quote, 'timestamp') or ''}",
+            f"错误信息：{failure_reason}",
+            "",
+            "【AkShare】",
+            f"是否成功：{'是' if not akshare_error else '否'}",
+            f"行业：{self._value(stock_info, 'industry') or ''}",
+            f"概念：{concept_text}",
+            f"MA5：{self._value(ma, 'MA5') or ''}",
+            f"MA20：{self._value(ma, 'MA20') or ''}",
+            f"MACD：{self._value(macd, 'MACD') or ''}",
+            f"错误信息：{akshare_error}",
+            "",
+            "【MarketDataService】",
+            f"quote_valid：{str(quote_valid).lower()}",
+            f"missing_fields：{missing_fields}",
+            "最终数据卡片：",
+            final_card,
         ])
         return AgentResponse(
             success=True,
@@ -1218,6 +1332,12 @@ class MarketAgent(BaseAgent):
                 "missing_fields": missing_fields,
             },
         )
+
+    @staticmethod
+    def _clean_debug_stock_query(raw_query: str) -> str:
+        cleaned = str(raw_query or "").strip()
+        cleaned = re.sub(r"^(?:/debug|debug\s+quote)\s+", "", cleaned, flags=re.I)
+        return cleaned.strip()
 
     def _extract_focus_symbol(self, message: str, items=None) -> str:
         symbol = self.market_data.extract_symbol(message)
@@ -1236,12 +1356,38 @@ class MarketAgent(BaseAgent):
                 return item.symbol
         return ""
 
+    def _requires_stock_resolution(self, message: str) -> bool:
+        if not message or is_news_intent(message):
+            return False
+        if self.market_data.extract_symbol(message):
+            return False
+        if any(word in message for word in ("大盘", "市场", "板块", "行业", "主线", "热点", "自选")):
+            return False
+        if any(word in message for word in ("查一下", "查询", "看一下", "看看", "看下")):
+            return True
+        if self._looks_like_stock_name_query(message):
+            return True
+        return False
+
     @staticmethod
     def _looks_like_stock_name_query(message: str) -> bool:
         cleaned = re.sub(r"\s+", "", str(message or "").strip())
         if not cleaned or len(cleaned) > 12:
             return False
-        if cleaned in {"你好", "您好", "谢谢", "早上好", "晚上好"}:
+        if cleaned in {
+            "你好",
+            "你好呀",
+            "您好",
+            "谢谢",
+            "早上好",
+            "晚上好",
+            "分析",
+            "启动",
+            "暂停",
+            "状态",
+        }:
+            return False
+        if any(word in cleaned for word in ("启动", "暂停", "状态", "系统")):
             return False
         return bool(re.search(r"[\u4e00-\u9fff]{2,}", cleaned))
 

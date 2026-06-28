@@ -198,13 +198,15 @@ class TestCanHandle:
 
     def test_can_handle_debug_quote(self, mock_deps):
         assert mock_deps["agent"].can_handle("debug quote 300136")
+        assert mock_deps["agent"].can_handle("debug quote 有研新材")
+        assert mock_deps["agent"].can_handle("/debug 有研新材")
 
     def test_can_handle_bare_stock_name_after_symbol_resolution(self, mock_deps):
         mock_deps["market_data"].extract_symbol.return_value = "600206"
 
         assert mock_deps["agent"].can_handle("有研新材")
 
-        mock_deps["market_data"].extract_symbol.assert_called_with("有研新材")
+        mock_deps["market_data"].extract_symbol.assert_not_called()
 
     @pytest.mark.parametrize("msg", [
         "信维通信今天有什么消息？",
@@ -260,6 +262,7 @@ class TestHandle:
 
     def test_handle_calls_chat_with_memory(self, mock_deps):
         """确认调用了 chat_with_memory"""
+        mock_deps["market_data"].extract_symbol.return_value = "000001"
         mock_deps["agent"].handle("session1", "分析平安银行")
         args = mock_deps["deepseek"].chat_with_memory.call_args.args
         kwargs = mock_deps["deepseek"].chat_with_memory.call_args.kwargs
@@ -372,15 +375,14 @@ class TestHandle:
             )
 
         assert resp.success is True
-        assert "source: EastMoney" in resp.message
-        assert "timestamp: 2026-06-22 10:00:00" in resp.message
-        assert "fetched_at: 2026-06-22 10:00:00" in resp.message
-        assert "data_age_seconds: 0" in resp.message
-        assert "price: 10.52" in resp.message
-        assert "change_pct: -0.48" in resp.message
-        assert "quote_valid: true" in resp.message
-        assert "failure_reason: " in resp.message
-        assert "missing_fields: []" in resp.message
+        assert "【Debug 股票解析】" in resp.message
+        assert "识别股票代码：300136" in resp.message
+        assert "是否成功：是" in resp.message
+        assert "价格：10.52" in resp.message
+        assert "涨跌幅：-0.48" in resp.message
+        assert "数据时间：2026-06-22 10:00:00" in resp.message
+        assert "quote_valid：true" in resp.message
+        assert "missing_fields：[]" in resp.message
         mock_deps["market_data"].get_quote.assert_called_once_with(
             "300136",
             market="CN",
@@ -419,8 +421,8 @@ class TestHandle:
                 "debug quote 300136",
             )
 
-        assert "quote_valid: false" in resp.message
-        assert "missing_fields: ['timestamp']" in resp.message
+        assert "quote_valid：false" in resp.message
+        assert "missing_fields：['timestamp']" in resp.message
 
     def test_debug_quote_reports_stale_quote(self, mock_deps):
         mock_deps["market_data"].get_quote.return_value = SimpleNamespace(
@@ -443,10 +445,60 @@ class TestHandle:
                 "debug quote 300136",
             )
 
-        assert "data_age_seconds: 600" in resp.message
-        assert "quote_valid: false" in resp.message
-        assert "failure_reason: stale_quote" in resp.message
-        assert "missing_fields: []" in resp.message
+        assert "quote_valid：false" in resp.message
+        assert "错误信息：stale_quote" in resp.message
+        assert "missing_fields：[]" in resp.message
+
+    def test_admin_can_debug_stock_name_without_calling_deepseek(self, mock_deps):
+        mock_deps["market_data"].extract_symbol.return_value = "600206"
+        mock_deps["market_data"].get_quote.return_value = QuoteSnapshot(
+            symbol="600206",
+            name="有研新材",
+            price=60.76,
+            change=4.61,
+            change_pct=8.19,
+            open_price=55.0,
+            high_price=61.63,
+            low_price=55.0,
+            prev_close=56.15,
+            volume=100000,
+            amount=8376000000,
+            amplitude_pct=11.8,
+            turnover_rate=9.2,
+            fetched_at="2026-06-26 16:12:00",
+            source="EastMoney",
+            timestamp="2026-06-26 16:11:50",
+            data_age_seconds=0,
+        )
+        mock_deps["market_data"].get_stock_info.return_value = StockInfo(
+            symbol="600206",
+            name="有研新材",
+            industry="小金属",
+            concepts=["靶材", "稀土永磁"],
+        )
+        with patch(
+            "src.agents.market_agent.settings.admin_user_open_id",
+            "ou_admin",
+        ):
+            resp = mock_deps["agent"].handle("ou_admin", "/debug 有研新材")
+
+        assert resp.success is True
+        assert "原始输入：有研新材" in resp.message
+        assert "清洗后输入：有研新材" in resp.message
+        assert "识别股票名称：有研新材" in resp.message
+        assert "识别股票代码：600206" in resp.message
+        assert "行业：小金属" in resp.message
+        assert "概念：靶材、稀土永磁" in resp.message
+        mock_deps["deepseek"].chat_with_memory.assert_not_called()
+
+    def test_unrecognized_stock_returns_clear_message(self, mock_deps):
+        mock_deps["market_data"].extract_symbol.return_value = None
+
+        resp = mock_deps["agent"].handle("session1", "查一下不存在股票")
+
+        assert resp.success is True
+        assert resp.message == "未能识别股票，请输入股票代码，例如 600206。"
+        mock_deps["deepseek"].chat_with_memory.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -529,7 +581,8 @@ class TestAnalyzeStock:
 
         result = mock_deps["agent"].analyze_stock("000001")
 
-        assert result == STOCK_DATA_FAILURE_MESSAGE
+        assert result.startswith(STOCK_DATA_FAILURE_MESSAGE)
+        assert "失败层级：EastMoney" in result
         mock_deps["deepseek"].chat.assert_not_called()
         mock_deps["market_data"].get_history.assert_not_called()
         mock_deps["market_data"].get_ma.assert_not_called()
@@ -545,7 +598,8 @@ class TestAnalyzeStock:
 
         result = mock_deps["agent"].analyze_stock("000001")
 
-        assert result == STOCK_DATA_FAILURE_MESSAGE
+        assert result.startswith(STOCK_DATA_FAILURE_MESSAGE)
+        assert "失败层级：EastMoney" in result
         mock_deps["deepseek"].chat.assert_not_called()
         mock_deps["market_data"].get_history.assert_not_called()
         mock_deps["market_data"].get_ma.assert_not_called()
@@ -641,7 +695,8 @@ class TestAnalyzeStock:
 
         result = mock_deps["agent"].analyze_stock("000001")
 
-        assert result == STOCK_DATA_FAILURE_MESSAGE
+        assert result.startswith(STOCK_DATA_FAILURE_MESSAGE)
+        assert "失败层级：EastMoney" in result
         mock_deps["deepseek"].chat.assert_not_called()
 
     @pytest.mark.parametrize(
@@ -671,7 +726,8 @@ class TestAnalyzeStock:
 
         result = mock_deps["agent"].analyze_stock("000001")
 
-        assert result == STOCK_DATA_FAILURE_MESSAGE
+        assert result.startswith(STOCK_DATA_FAILURE_MESSAGE)
+        assert "失败层级：AkShare" in result
         mock_deps["deepseek"].chat.assert_not_called()
 
     def test_akshare_exception_stops_stock_analysis(self, mock_deps):
@@ -680,7 +736,8 @@ class TestAnalyzeStock:
 
         result = mock_deps["agent"].analyze_stock("000001")
 
-        assert result == STOCK_DATA_FAILURE_MESSAGE
+        assert result.startswith(STOCK_DATA_FAILURE_MESSAGE)
+        assert "失败层级：AkShare" in result
         mock_deps["deepseek"].chat.assert_not_called()
 
     def test_handle_stock_data_failure_returns_fixed_message_without_llm(
@@ -697,7 +754,8 @@ class TestAnalyzeStock:
         resp = mock_deps["agent"].handle("session1", "分析 000001")
 
         assert resp.success is True
-        assert resp.message == STOCK_DATA_FAILURE_MESSAGE
+        assert resp.message.startswith(STOCK_DATA_FAILURE_MESSAGE)
+        assert "失败层级：EastMoney" in resp.message
         assert resp.metadata["data_available"] is False
         mock_deps["deepseek"].chat_with_memory.assert_not_called()
 
@@ -714,7 +772,8 @@ class TestAnalyzeStock:
 
         resp = mock_deps["agent"].handle("session1", "有研新材")
 
-        assert resp.message == STOCK_DATA_FAILURE_MESSAGE
+        assert resp.message.startswith(STOCK_DATA_FAILURE_MESSAGE)
+        assert "失败层级：EastMoney" in resp.message
         mock_deps["market_data"].get_quote.assert_called_with(
             "600206",
             market="CN",

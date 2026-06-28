@@ -124,12 +124,18 @@ class FeishuClient:
 
     # ── 消息发送 ─────────────────────────────────────────
 
-    def send_text(self, receive_id: str, content: str) -> dict:
+    def send_text(
+        self,
+        receive_id: str,
+        content: str,
+        receive_id_type: str = "open_id",
+    ) -> dict:
         """发送文本消息
 
         Args:
             receive_id: 接收方 open_id 或 chat_id
             content: 消息文本
+            receive_id_type: open_id / chat_id 等飞书接收 ID 类型
 
         Returns:
             API 响应 JSON
@@ -139,7 +145,10 @@ class FeishuClient:
             "msg_type": "text",
             "content": json.dumps({"text": content}, ensure_ascii=False),
         }
-        return self._post("/im/v1/messages?receive_id_type=open_id", body)
+        return self._post(
+            f"/im/v1/messages?receive_id_type={receive_id_type}",
+            body,
+        )
 
     def reply_text(self, message_id: str, content: str) -> dict:
         """回复消息

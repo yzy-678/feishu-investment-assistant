@@ -173,6 +173,23 @@ class TestSendText:
         assert json.loads(sent_json["content"])["text"] == "测试内容"
 
     @patch("httpx.Client")
+    def test_send_text_chat_id_receive_type(self, mock_client_class, client):
+        """普通群消息应支持 receive_id_type=chat_id。"""
+        mock_cli = MagicMock()
+        mock_cli.__enter__.return_value = mock_cli
+        mock_cli.post.side_effect = [
+            token_response(),
+            send_response(),
+        ]
+        mock_client_class.return_value = mock_cli
+
+        client.send_text("oc_chat", "测试内容", receive_id_type="chat_id")
+
+        send_call = mock_cli.post.call_args_list[1]
+        assert "receive_id_type=chat_id" in send_call.args[0]
+        assert send_call.kwargs["json"]["receive_id"] == "oc_chat"
+
+    @patch("httpx.Client")
     def test_send_text_api_error(self, mock_client_class, client):
         """API 返回错误码"""
         mock_cli = MagicMock()

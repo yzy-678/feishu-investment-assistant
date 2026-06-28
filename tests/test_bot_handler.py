@@ -87,7 +87,8 @@ def test_register_agents_order(mock_deps):
 
 
 def make_text_event(text: str, open_id: str = "ou_test",
-                    message_id: str = "om_test") -> dict:
+                    message_id: str = "om_test",
+                    chat_id: str = "") -> dict:
     """构造飞书文本消息事件"""
     return {
         "schema": "2.0",
@@ -100,6 +101,7 @@ def make_text_event(text: str, open_id: str = "ou_test",
                 "message_id": message_id,
                 "content": json.dumps({"text": text}),
                 "message_type": "text",
+                **({"chat_id": chat_id} if chat_id else {}),
             },
             "sender": {
                 "sender_id": {"open_id": open_id},
@@ -109,8 +111,14 @@ def make_text_event(text: str, open_id: str = "ou_test",
 
 
 def make_text_event_with_content(content: str, open_id: str = "ou_test",
-                                 message_id: str = "om_test") -> dict:
-    event = make_text_event("", open_id=open_id, message_id=message_id)
+                                 message_id: str = "om_test",
+                                 chat_id: str = "") -> dict:
+    event = make_text_event(
+        "",
+        open_id=open_id,
+        message_id=message_id,
+        chat_id=chat_id,
+    )
     event["event"]["message"]["content"] = content
     return event
 
@@ -431,10 +439,72 @@ class TestEventParsing:
         )
         event = make_text_event("有研新材", message_id="om_original_cn")
 
-        mock_deps["handler"].handle_event(event)
+        with patch("src.bot.handler.settings.use_reply_message", True):
+            mock_deps["handler"].handle_event(event)
 
         mock_deps["feishu"].reply_text.assert_called_once_with(
             "om_original_cn",
+            "市场回复",
+        )
+
+    def test_use_reply_message_false_sends_text_to_chat_id(self, mock_deps):
+        """默认关闭引用回复时，应普通发送到 chat_id，避免引用预览乱码。"""
+        mock_deps["coordinator"].route.return_value = AgentResponse(
+            success=True, agent=AgentType.MARKET, message="市场回复",
+        )
+        event = make_text_event(
+            "有研新材",
+            message_id="om_no_quote",
+            chat_id="oc_group_1",
+        )
+
+        with patch("src.bot.handler.settings.use_reply_message", False):
+            result = mock_deps["handler"].handle_event(event)
+
+        assert result == "市场回复"
+        mock_deps["feishu"].send_text.assert_called_once_with(
+            "oc_group_1",
+            "市场回复",
+            receive_id_type="chat_id",
+        )
+        mock_deps["feishu"].reply_text.assert_not_called()
+
+    def test_use_reply_message_true_uses_reply_text(self, mock_deps):
+        """开启引用回复时，仍使用 reply_text(message_id)。"""
+        mock_deps["coordinator"].route.return_value = AgentResponse(
+            success=True, agent=AgentType.MARKET, message="市场回复",
+        )
+        event = make_text_event(
+            "有研新材",
+            message_id="om_quote",
+            chat_id="oc_group_1",
+        )
+
+        with patch("src.bot.handler.settings.use_reply_message", True):
+            result = mock_deps["handler"].handle_event(event)
+
+        assert result == "市场回复"
+        mock_deps["feishu"].reply_text.assert_called_once_with(
+            "om_quote",
+            "市场回复",
+        )
+        mock_deps["feishu"].send_text.assert_not_called()
+
+    def test_use_reply_message_false_falls_back_to_reply_without_chat_id(
+        self,
+        mock_deps,
+    ):
+        """关闭引用但 chat_id 缺失时，回退 reply_text。"""
+        mock_deps["coordinator"].route.return_value = AgentResponse(
+            success=True, agent=AgentType.MARKET, message="市场回复",
+        )
+        event = make_text_event("有研新材", message_id="om_no_chat")
+
+        with patch("src.bot.handler.settings.use_reply_message", False):
+            mock_deps["handler"].handle_event(event)
+
+        mock_deps["feishu"].reply_text.assert_called_once_with(
+            "om_no_chat",
             "市场回复",
         )
 

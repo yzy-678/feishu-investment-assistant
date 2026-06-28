@@ -18,6 +18,7 @@ from src.ai.deepseek import DeepSeekError
 from src.agents.alert_agent import AlertAgent, get_alert_agent
 from src.bot.client import FeishuClient, FeishuError, get_feishu_client
 from src.config.manager import ConfigManager, get_config
+from src.config.settings import settings
 from src.watchlist.manager import WatchlistError, WatchlistManager, get_watchlist
 from src.agents.base import BaseAgent
 from src.agents.coordinator import AgentCoordinator, get_coordinator
@@ -119,6 +120,7 @@ class MessageHandler:
             sender = event.get("sender", {}).get("sender_id", {})
 
             message_id = message.get("message_id", "")
+            chat_id = message.get("chat_id", "")
             content_str: str = message.get("content", "{}")
             open_id: str = sender.get("open_id", "")
             logger.info(
@@ -160,7 +162,12 @@ class MessageHandler:
 
             if not text:
                 reply = "消息不能为空，请重新输入。"
-                self.feishu.reply_text(message_id, reply)
+                self._send_reply(
+                    message_id=message_id,
+                    chat_id=chat_id,
+                    open_id=open_id,
+                    content=reply,
+                )
                 success = True
                 return reply
 
@@ -184,7 +191,12 @@ class MessageHandler:
                         ensure_ascii=False,
                     ),
                 )
-                self.feishu.reply_text(message_id, truncated)
+                self._send_reply(
+                    message_id=message_id,
+                    chat_id=chat_id,
+                    open_id=open_id,
+                    content=truncated,
+                )
                 logger.info(
                     "Replied to %s: %.40s... (%d chars)",
                     open_id[:8], text, len(truncated),
@@ -201,6 +213,33 @@ class MessageHandler:
         finally:
             if claimed and message_id:
                 self._finalize_message(message_id, success)
+
+    def _send_reply(
+        self,
+        message_id: str,
+        chat_id: str,
+        open_id: str,
+        content: str,
+    ) -> None:
+        """发送飞书回复。
+
+        默认不使用 message reply，避免飞书客户端引用预览乱码。
+        有 chat_id 时发送普通群消息；缺失 chat_id 时回退到原 reply_text。
+        """
+        if settings.use_reply_message:
+            self.feishu.reply_text(message_id, content)
+            return
+
+        if chat_id:
+            self.feishu.send_text(chat_id, content, receive_id_type="chat_id")
+            return
+
+        logger.warning(
+            "Feishu chat_id missing, fallback to reply_text: message_id=%s open_id=%s",
+            message_id,
+            open_id[:8],
+        )
+        self.feishu.reply_text(message_id, content)
 
     # ── 消息处理 ─────────────────────────────────────────
 

@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     feishu_event_encrypt_key: str = ""
     """飞书事件回调加密 Key（可选，启用加密时必填）"""
 
+    use_reply_message: bool = False
+    """是否使用飞书引用回复；默认关闭，避免客户端引用预览乱码"""
+
     # ── 管理员 ────────────────────────────────────────────────
     admin_user_open_id: str = ""
     """管理员飞书 open_id（权限控制用）"""
