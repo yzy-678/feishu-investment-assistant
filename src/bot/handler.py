@@ -17,6 +17,7 @@ from typing import Optional
 from src.ai.deepseek import DeepSeekError
 from src.agents.alert_agent import AlertAgent, get_alert_agent
 from src.bot.client import FeishuClient, FeishuError, get_feishu_client
+from src.bot.text_utils import sanitize_text
 from src.config.manager import ConfigManager, get_config
 from src.config.settings import settings
 from src.watchlist.manager import WatchlistError, WatchlistManager, get_watchlist
@@ -154,7 +155,7 @@ class MessageHandler:
                 "Feishu json.loads(content) parsed: %s",
                 json.dumps(content_data, ensure_ascii=False, default=str),
             )
-            text = self._extract_message_text(message, content_data)
+            text = sanitize_text(self._extract_message_text(message, content_data))
             logger.info(
                 "Feishu final message_text for coordinator: %s",
                 text,
@@ -176,7 +177,8 @@ class MessageHandler:
 
             # 发送回复
             if reply:
-                truncated = reply[:MAX_REPLY_LENGTH]
+                truncated = sanitize_text(reply[:MAX_REPLY_LENGTH])
+                logger.info("BotHandler final_text repr before Feishu: %r", truncated)
                 logger.info(
                     "Final reply to user data: %s",
                     json.dumps(

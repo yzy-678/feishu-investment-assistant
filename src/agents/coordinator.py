@@ -145,7 +145,13 @@ class AgentCoordinator:
                     message[:50],
                 )
                 try:
-                    return agent.handle(session_id, message)
+                    response = agent.handle(session_id, message)
+                    logger.info(
+                        "AgentResponse before return: agent=%s message_repr=%r",
+                        response.agent.value,
+                        response.message,
+                    )
+                    return response
                 except Exception as exc:
                     logger.exception(
                         "Agent %s handle() failed: %s",

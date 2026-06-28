@@ -295,6 +295,8 @@ class DeepSeekClient:
 
         try:
             content: str = data["choices"][0]["message"]["content"]
+            logger.info("DeepSeek raw_llm_reply repr: %r", content)
+            logger.info("DeepSeek raw_llm_reply preview: %s", content[:500])
             logger.debug("API call success: %d msg, %d tokens in, %d chars out",
                          len(messages),
                          sum(self.estimate_tokens(m.get("content", "")) for m in messages),

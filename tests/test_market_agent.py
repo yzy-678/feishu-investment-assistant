@@ -202,8 +202,6 @@ class TestCanHandle:
         assert mock_deps["agent"].can_handle("/debug 有研新材")
 
     def test_can_handle_bare_stock_name_after_symbol_resolution(self, mock_deps):
-        mock_deps["market_data"].extract_symbol.return_value = "600206"
-
         assert mock_deps["agent"].can_handle("有研新材")
 
         mock_deps["market_data"].extract_symbol.assert_not_called()
@@ -287,30 +285,27 @@ class TestHandle:
 
     def test_handle_prefixes_code_generated_quote_block(self, mock_deps):
         """个股分析回复应前置代码生成的实时行情块"""
-        mock_deps["market_data"].extract_symbol.return_value = "000001"
         mock_deps["deepseek"].chat_with_memory.return_value = "AI 只负责解读"
 
         resp = mock_deps["agent"].handle("session1", "分析 000001")
 
-        assert resp.message.startswith("📈 实时行情")
+        assert resp.message.startswith("【数据卡片】")
+        assert "股票代码：000001" in resp.message
         assert "数据来源：EastMoney" in resp.message
         assert "数据时间：2026-06-22 10:00:00" in resp.message
         assert "当前价：10.52" in resp.message
         assert "涨跌幅：-0.48%" in resp.message
         assert "成交额：0.98 亿" in resp.message
-        assert "📊 技术分析" in resp.message
-        assert "MA5=10.8000" in resp.message
-        assert "MACD=0.0800" in resp.message
-        assert "🏭 行业属性" in resp.message
-        assert "所属行业：银行" in resp.message
-        assert "所属概念：互联金融、破净股" in resp.message
+        assert "MA5/MA20：MA5=10.8000，MA20=10.5500" in resp.message
+        assert "MACD：0.0800" in resp.message
+        assert "行业：银行" in resp.message
+        assert "概念：互联金融、破净股" in resp.message
         assert "🧠 AI综合判断" in resp.message
         assert "⚠ 风险提示" in resp.message
         assert "AI 只负责解读" in resp.message
 
     def test_handle_removes_llm_generated_quote_lines(self, mock_deps):
         """最终回复不得保留 LLM 生成/篡改的行情字段"""
-        mock_deps["market_data"].extract_symbol.return_value = "000001"
         mock_deps["deepseek"].chat_with_memory.return_value = (
             "【实时行情】\n"
             "数据来源：LLM\n"
@@ -339,8 +334,6 @@ class TestHandle:
 
     def test_handle_stock_uses_akshare_data_via_market_service(self, mock_deps):
         """个股分析应通过 MarketDataService 注入 AkShare 历史/技术/行业数据。"""
-        mock_deps["market_data"].extract_symbol.return_value = "000001"
-
         mock_deps["agent"].handle("session1", "分析 000001")
 
         mock_deps["market_data"].get_quote.assert_called_with(
@@ -357,6 +350,7 @@ class TestHandle:
 
         kwargs = mock_deps["deepseek"].chat_with_memory.call_args.kwargs
         prompt_context = "\n".join(kwargs["system_messages"])
+        assert "【数据卡片】" in prompt_context
         assert "【实时行情】" in prompt_context
         assert "【技术分析】" in prompt_context
         assert "【行业属性】" in prompt_context
@@ -450,7 +444,6 @@ class TestHandle:
         assert "missing_fields：[]" in resp.message
 
     def test_admin_can_debug_stock_name_without_calling_deepseek(self, mock_deps):
-        mock_deps["market_data"].extract_symbol.return_value = "600206"
         mock_deps["market_data"].get_quote.return_value = QuoteSnapshot(
             symbol="600206",
             name="有研新材",
@@ -492,13 +485,18 @@ class TestHandle:
         mock_deps["deepseek"].chat_with_memory.assert_not_called()
 
     def test_unrecognized_stock_returns_clear_message(self, mock_deps):
-        mock_deps["market_data"].extract_symbol.return_value = None
-
         resp = mock_deps["agent"].handle("session1", "查一下不存在股票")
 
         assert resp.success is True
         assert resp.message == "未能识别股票，请输入股票代码，例如 600206。"
         mock_deps["deepseek"].chat_with_memory.assert_not_called()
+
+    def test_bare_stock_name_resolves_to_symbol(self, mock_deps):
+        resp = mock_deps["agent"].handle("session1", "有研新材")
+
+        assert resp.success is True
+        mock_deps["market_data"].get_quote.assert_called_with("600206", market="CN")
+        assert "股票名称：平安银行" in resp.message or "股票代码：600206" in resp.message
 
 
 # ═══════════════════════════════════════════════════════════
@@ -513,11 +511,11 @@ class TestAnalyzeStock:
         """个股分析"""
         mock_deps["deepseek"].chat.return_value = "平安银行分析结果"
         result = mock_deps["agent"].analyze_stock("000001")
-        assert result.startswith("📈 实时行情")
+        assert result.startswith("【数据卡片】")
         assert "数据来源：EastMoney" in result
         assert "当前价：10.52" in result
-        assert "📊 技术分析" in result
-        assert "🏭 行业属性" in result
+        assert "MA5/MA20：MA5=10.8000，MA20=10.5500" in result
+        assert "行业：银行" in result
         assert "🧠 AI综合判断" in result
         assert "⚠ 风险提示" in result
         assert "平安银行分析结果" in result
@@ -528,6 +526,7 @@ class TestAnalyzeStock:
         assert INVESTMENT_ASSISTANT_SYSTEM_PROMPT in messages[0]["content"]
         prompt = messages[1]["content"]
         assert "000001" in prompt
+        assert "【数据卡片】" in prompt
         assert "【实时行情】" in prompt
         assert "数据来源：EastMoney" in prompt
         assert "【技术分析】" in prompt
@@ -575,22 +574,19 @@ class TestAnalyzeStock:
         ],
     )
     def test_invalid_quote_stops_stock_analysis(self, mock_deps, quote):
-        """缺失关键行情字段时，必须直接失败，不允许模型继续分析。"""
+        """缺失关键行情字段时，若 AkShare 可用仍可降级分析。"""
         mock_deps["market_data"].get_quote.return_value = quote
         mock_deps["deepseek"].chat.return_value = "基本面分析"
 
         result = mock_deps["agent"].analyze_stock("000001")
 
-        assert result.startswith(STOCK_DATA_FAILURE_MESSAGE)
-        assert "失败层级：EastMoney" in result
-        mock_deps["deepseek"].chat.assert_not_called()
-        mock_deps["market_data"].get_history.assert_not_called()
-        mock_deps["market_data"].get_ma.assert_not_called()
-        mock_deps["market_data"].get_macd.assert_not_called()
-        mock_deps["market_data"].get_stock_info.assert_not_called()
+        assert result.startswith("【数据卡片】")
+        assert "实时行情暂缺" in result
+        assert "基本面分析" in result
+        mock_deps["deepseek"].chat.assert_called_once()
 
     def test_quote_fetch_error_stops_stock_analysis(self, mock_deps):
-        """EastMoney 返回异常时，必须直接失败，不允许模型继续分析。"""
+        """EastMoney 返回异常时，若 AkShare 可用仍可降级分析。"""
         mock_deps["market_data"].get_quote.side_effect = MarketDataError(
             "timeout",
             reason="timeout",
@@ -598,13 +594,9 @@ class TestAnalyzeStock:
 
         result = mock_deps["agent"].analyze_stock("000001")
 
-        assert result.startswith(STOCK_DATA_FAILURE_MESSAGE)
-        assert "失败层级：EastMoney" in result
-        mock_deps["deepseek"].chat.assert_not_called()
-        mock_deps["market_data"].get_history.assert_not_called()
-        mock_deps["market_data"].get_ma.assert_not_called()
-        mock_deps["market_data"].get_macd.assert_not_called()
-        mock_deps["market_data"].get_stock_info.assert_not_called()
+        assert result.startswith("【数据卡片】")
+        assert "实时行情暂缺" in result
+        mock_deps["deepseek"].chat.assert_called_once()
 
     def test_analyze_stock_deepseek_error(self, mock_deps):
         """DeepSeek 异常应向上传递"""
@@ -649,9 +641,9 @@ class TestAnalyzeStock:
         assert '"price": 10.52' in logs
         assert '"change_pct": -0.48' in logs
         assert "MarketAgent prompt quote data:" in logs
-        assert '"quote_block": "📈 实时行情' in logs
+        assert '"quote_block": "【数据卡片】' in logs
         assert "MarketAgent final user data:" in logs
-        assert '"final_response": "📈 实时行情' in logs
+        assert '"final_response": "【数据卡片】' in logs
 
     def test_missing_quote_fields_logged(self, mock_deps, caplog):
         caplog.set_level("INFO", logger="src.agents.market_agent")
@@ -695,9 +687,9 @@ class TestAnalyzeStock:
 
         result = mock_deps["agent"].analyze_stock("000001")
 
-        assert result.startswith(STOCK_DATA_FAILURE_MESSAGE)
-        assert "失败层级：EastMoney" in result
-        mock_deps["deepseek"].chat.assert_not_called()
+        assert result.startswith("【数据卡片】")
+        assert "实时行情暂缺" in result
+        mock_deps["deepseek"].chat.assert_called_once()
 
     @pytest.mark.parametrize(
         ("field", "value"),
@@ -714,7 +706,7 @@ class TestAnalyzeStock:
         field,
         value,
     ):
-        """AkShare 任一数据为空或字段缺失时，必须直接失败，不允许模型继续分析。"""
+        """AkShare 任一数据缺失时，EastMoney 可用则不阻断分析。"""
         if field == "history":
             mock_deps["market_data"].get_history.return_value = value
         elif field == "ma":
@@ -726,36 +718,39 @@ class TestAnalyzeStock:
 
         result = mock_deps["agent"].analyze_stock("000001")
 
-        assert result.startswith(STOCK_DATA_FAILURE_MESSAGE)
-        assert "失败层级：AkShare" in result
-        mock_deps["deepseek"].chat.assert_not_called()
+        assert result.startswith("【数据卡片】")
+        assert "技术指标暂缺" in result or "行业概念暂缺" in result
+        mock_deps["deepseek"].chat.assert_called_once()
 
     def test_akshare_exception_stops_stock_analysis(self, mock_deps):
-        """AkShare 超时/异常时，必须直接失败，不允许模型继续分析。"""
+        """AkShare 超时/异常时，EastMoney 可用则不阻断分析。"""
         mock_deps["market_data"].get_macd.side_effect = TimeoutError("timeout")
 
         result = mock_deps["agent"].analyze_stock("000001")
 
-        assert result.startswith(STOCK_DATA_FAILURE_MESSAGE)
-        assert "失败层级：AkShare" in result
-        mock_deps["deepseek"].chat.assert_not_called()
+        assert result.startswith("【数据卡片】")
+        assert "技术指标暂缺" in result
+        mock_deps["deepseek"].chat.assert_called_once()
 
     def test_handle_stock_data_failure_returns_fixed_message_without_llm(
         self,
         mock_deps,
     ):
         """普通聊天入口遇到个股数据失败时，也必须直接返回固定文案。"""
-        mock_deps["market_data"].extract_symbol.return_value = "000001"
         mock_deps["market_data"].get_quote.side_effect = MarketDataError(
             "timeout",
             reason="timeout",
         )
+        mock_deps["market_data"].get_history.side_effect = TimeoutError("timeout")
+        mock_deps["market_data"].get_ma.side_effect = TimeoutError("timeout")
+        mock_deps["market_data"].get_macd.side_effect = TimeoutError("timeout")
+        mock_deps["market_data"].get_stock_info.side_effect = TimeoutError("timeout")
 
         resp = mock_deps["agent"].handle("session1", "分析 000001")
 
         assert resp.success is True
         assert resp.message.startswith(STOCK_DATA_FAILURE_MESSAGE)
-        assert "失败层级：EastMoney" in resp.message
+        assert "失败层级：MarketDataService" in resp.message
         assert resp.metadata["data_available"] is False
         mock_deps["deepseek"].chat_with_memory.assert_not_called()
 
@@ -764,16 +759,19 @@ class TestAnalyzeStock:
         mock_deps,
     ):
         """裸股票名进入 MarketAgent 后，也必须执行实时数据硬门禁。"""
-        mock_deps["market_data"].extract_symbol.return_value = "600206"
         mock_deps["market_data"].get_quote.side_effect = MarketDataError(
             "timeout",
             reason="timeout",
         )
+        mock_deps["market_data"].get_history.side_effect = TimeoutError("timeout")
+        mock_deps["market_data"].get_ma.side_effect = TimeoutError("timeout")
+        mock_deps["market_data"].get_macd.side_effect = TimeoutError("timeout")
+        mock_deps["market_data"].get_stock_info.side_effect = TimeoutError("timeout")
 
         resp = mock_deps["agent"].handle("session1", "有研新材")
 
         assert resp.message.startswith(STOCK_DATA_FAILURE_MESSAGE)
-        assert "失败层级：EastMoney" in resp.message
+        assert "失败层级：MarketDataService" in resp.message
         mock_deps["market_data"].get_quote.assert_called_with(
             "600206",
             market="CN",

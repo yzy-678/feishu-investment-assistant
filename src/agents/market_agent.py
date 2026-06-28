@@ -5,6 +5,8 @@
 依赖 DeepSeekClient、ConversationMemory、WatchlistManager、ConfigManager。
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import re
@@ -19,8 +21,12 @@ from src.config.settings import settings
 from src.market import (
     MAX_QUOTE_AGE_SECONDS,
     MarketDataError,
+    ResolvedStock,
+    StockResolver,
     get_market_data_service,
+    get_stock_resolver,
 )
+from src.bot.text_utils import sanitize_text
 from src.memory import ConversationMemory, get_memory
 from src.watchlist.manager import WatchlistManager, WatchlistError, get_watchlist
 
@@ -90,6 +96,7 @@ class MarketAgent(BaseAgent):
         self.watchlist: WatchlistManager = get_watchlist()
         self.config: ConfigManager = get_config()
         self.market_data = get_market_data_service()
+        self.stock_resolver: StockResolver = get_stock_resolver()
         self._initialized = True
         logger.info("MarketAgent initialized")
 
@@ -134,18 +141,11 @@ class MarketAgent(BaseAgent):
                 )
 
             if self._requires_stock_resolution(stripped_message):
-                symbol = self._extract_focus_symbol(stripped_message)
-                if not symbol:
-                    return AgentResponse(
-                        success=True,
-                        agent=AgentType.MARKET,
-                        message=STOCK_UNRECOGNIZED_MESSAGE,
-                        metadata={
-                            "session_id": session_id,
-                            "data_available": False,
-                            "reason": "symbol_unrecognized",
-                        },
-                    )
+                resolved = self._resolve_focus_stock(stripped_message)
+                if resolved is None:
+                    return self._stock_unrecognized_response(session_id)
+                if isinstance(resolved, tuple):
+                    return self._stock_ambiguous_response(session_id, resolved)
 
             # 1. 构建本轮增强上下文（不写入长期记忆，避免历史行情复活）
             market_context, reply_quote_block, stock_data_valid = (
@@ -181,6 +181,7 @@ class MarketAgent(BaseAgent):
                 quote_block=reply_quote_block,
                 llm_response=llm_response,
             )
+            logger.info("MarketAgent agent_response.message repr: %r", response)
             self._log_final_user_data(session_id, reply_quote_block, response)
 
             logger.info(
@@ -224,10 +225,9 @@ class MarketAgent(BaseAgent):
             DeepSeekError: API 调用失败
         """
         market = self.config.get_market()
-        data_context, data_valid, quote_block = self._build_stock_context(
-            symbol,
-            market,
-        )
+        resolved = self.stock_resolver.resolve(symbol).stock
+        stock = resolved or ResolvedStock(symbol=symbol, name=symbol, exchange="", market=market)
+        data_context, data_valid, quote_block = self._build_stock_context(stock, market)
         if not data_valid:
             failure_message = self._build_stock_failure_message(data_context)
             self._log_final_user_data(
@@ -248,7 +248,9 @@ class MarketAgent(BaseAgent):
             {"role": "system", "content": INVESTMENT_ASSISTANT_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ])
-        return self._compose_final_response(quote_block, llm_response)
+        response = self._compose_final_response(quote_block, llm_response)
+        logger.info("MarketAgent agent_response.message repr: %r", response)
+        return response
 
     def analyze_watchlist(self) -> str:
         """分析当前自选股组合
@@ -352,7 +354,12 @@ class MarketAgent(BaseAgent):
             logger.warning("Failed to load watchlist for market context")
             parts.append("\\n(自选股信息暂不可用)")
 
-        focus_symbol = self._extract_focus_symbol(message, items)
+        focus_stock = self._resolve_focus_stock(message, items)
+        focus_symbol = (
+            focus_stock.symbol
+            if isinstance(focus_stock, ResolvedStock)
+            else ""
+        )
         realtime_context = self._build_realtime_context(
             market=market,
             watchlist_items=items,
@@ -366,9 +373,9 @@ class MarketAgent(BaseAgent):
         reply_quote_block = realtime_context
         stock_data_valid = True
 
-        if focus_symbol:
+        if isinstance(focus_stock, ResolvedStock):
             stock_context, stock_data_valid, reply_quote_block = self._build_stock_context(
-                focus_symbol, market
+                focus_stock, market
             )
             parts.append(stock_context)
 
@@ -394,16 +401,35 @@ class MarketAgent(BaseAgent):
             return f"【实时行情】暂不可用：{exc}"
 
     def _build_stock_data_context(self, symbol: str, market: str) -> str:
-        context, _, _ = self._build_stock_context(symbol, market)
+        stock = self.stock_resolver.resolve(symbol).stock or ResolvedStock(
+            symbol=symbol,
+            name=symbol,
+            exchange="",
+            market=market,
+        )
+        context, _, _ = self._build_stock_context(stock, market)
         return context
 
-    def _build_stock_context(self, symbol: str, market: str) -> tuple[str, bool, str]:
+    def _build_stock_context(
+        self,
+        stock_or_symbol: ResolvedStock | str,
+        market: str,
+    ) -> tuple[str, bool, str]:
+        stock = self._as_resolved_stock(stock_or_symbol, market)
+        symbol = stock.symbol
+
         if settings.data_source.strip().lower() != "eastmoney":
             block = self._build_invalid_quote_block()
-            display_block = self._build_stock_display_block(
-                quote_block=block,
-                technical_block=self._build_unavailable_technical_block(),
-                industry_block=self._build_unavailable_industry_block(symbol),
+            technical_block = self._build_unavailable_technical_block()
+            industry_block = self._build_unavailable_industry_block(symbol)
+            display_block = self._build_stock_data_card(
+                stock,
+                None,
+                False,
+                technical_block,
+                False,
+                industry_block,
+                False,
             )
             self._log_quote_data(
                 symbol,
@@ -431,107 +457,67 @@ class MarketAgent(BaseAgent):
             )
 
         quote = None
+        quote_valid = False
+        quote_failure_reason = ""
         try:
             quote = self.market_data.get_quote(symbol, market=market)
         except MarketDataError as exc:
             logger.warning("Failed to build stock data context for %s: %s", symbol, exc)
+            quote_failure_reason = getattr(exc, "reason", "unknown")
             self._log_quote_state(
                 symbol,
                 None,
                 quote_valid=False,
-                failure_reason=getattr(exc, "reason", "unknown"),
-            )
-            block = self._build_invalid_quote_block()
-            failure_reason = getattr(exc, "reason", "unknown")
-            technical_block = self._build_unavailable_technical_block()
-            industry_block = self._build_unavailable_industry_block(symbol)
-            display_block = self._build_stock_display_block(
-                quote_block=block,
-                technical_block=technical_block,
-                industry_block=industry_block,
+                failure_reason=quote_failure_reason,
             )
             self._log_quote_data(
                 symbol,
                 None,
                 quote_valid=False,
-                failure_reason=failure_reason,
+                failure_reason=quote_failure_reason,
             )
-            self._log_prompt_quote_data(
-                symbol=symbol,
-                quote_block=display_block,
-                quote_valid=False,
-                failure_reason=failure_reason,
+        else:
+            quote_valid = self._is_quote_valid(quote)
+            quote_failure_reason = self._quote_failure_reason(quote)
+            self._log_quote_state(
+                symbol,
+                quote,
+                quote_valid=quote_valid,
+                failure_reason=quote_failure_reason,
             )
-            return (
-                "\n".join([
-                    block,
-                    technical_block,
-                    industry_block,
-                    f"行情状态：{symbol} 行情暂不可用：{exc}",
-                    REALTIME_QUOTE_RULES,
-                    TECHNICAL_ANALYSIS_RULES,
-                    "分析范围：仅可分析基本面、行业逻辑和风险因素。",
-                ]),
-                False,
-                display_block,
+            self._log_quote_data(
+                symbol,
+                quote,
+                quote_valid=quote_valid,
+                failure_reason=quote_failure_reason,
             )
 
-        quote_valid = self._is_quote_valid(quote)
-        failure_reason = self._quote_failure_reason(quote)
-        self._log_quote_state(
-            symbol,
-            quote,
-            quote_valid=quote_valid,
-            failure_reason=failure_reason,
-        )
-        block = self._build_quote_block(quote, quote_valid)
-        self._log_quote_data(
-            symbol,
-            quote,
-            quote_valid=quote_valid,
-            failure_reason=failure_reason,
-        )
-        if not quote_valid:
-            technical_block = self._build_unavailable_technical_block()
-            industry_block = self._build_unavailable_industry_block(symbol)
-            display_block = self._build_stock_display_block(
-                quote_block=block,
-                technical_block=technical_block,
-                industry_block=industry_block,
-            )
-            self._log_prompt_quote_data(
-                symbol=symbol,
-                quote_block=display_block,
-                quote_valid=False,
-                failure_reason=failure_reason or "invalid_quote",
-            )
-            return (
-                "\n".join([
-                    block,
-                    technical_block,
-                    industry_block,
-                    REALTIME_QUOTE_RULES,
-                    TECHNICAL_ANALYSIS_RULES,
-                    "行情状态：实时行情无效，禁止继续分析。",
-                ]),
-                False,
-                display_block,
-            )
-
+        quote_block = self._build_quote_block(quote, quote_valid)
         technical_block, technical_valid, technical_failure = (
             self._build_technical_block_with_status(symbol)
         )
         industry_block, industry_valid, industry_failure = (
             self._build_industry_block_with_status(symbol)
         )
-        data_valid = technical_valid and industry_valid
+        akshare_valid = technical_valid or industry_valid
+        data_valid = quote_valid or akshare_valid
         data_failure_reason = ";".join(
-            reason for reason in (technical_failure, industry_failure) if reason
+            reason
+            for reason in (
+                quote_failure_reason if not quote_valid else "",
+                technical_failure if not technical_valid else "",
+                industry_failure if not industry_valid else "",
+            )
+            if reason
         )
-        display_block = self._build_stock_display_block(
-            quote_block=block,
+        display_block = self._build_stock_data_card(
+            stock,
+            quote,
+            quote_valid,
             technical_block=technical_block,
+            technical_valid=technical_valid,
             industry_block=industry_block,
+            industry_valid=industry_valid,
         )
         self._log_prompt_quote_data(
             symbol=symbol,
@@ -541,7 +527,8 @@ class MarketAgent(BaseAgent):
         )
 
         lines = [
-            block,
+            display_block,
+            quote_block,
             technical_block,
             industry_block,
             REALTIME_QUOTE_RULES,
@@ -550,8 +537,15 @@ class MarketAgent(BaseAgent):
         ]
 
         if not data_valid:
-            lines.append("行情状态：AkShare 数据不完整，禁止继续分析。")
+            lines.append("行情状态：EastMoney 和 AkShare 均失败，禁止继续分析。")
             return "\n".join(lines), False, display_block
+
+        if not quote_valid:
+            lines.append("行情状态：EastMoney 实时行情暂缺，不得分析今日走势、当前强弱或盘中表现。")
+        if not technical_valid:
+            lines.append("技术指标状态：技术指标暂缺。")
+        if not industry_valid:
+            lines.append("行业概念状态：行业概念暂缺。")
 
         return "\n".join(lines), True, display_block
 
@@ -705,6 +699,67 @@ class MarketAgent(BaseAgent):
         ])
 
     @staticmethod
+    def _as_resolved_stock(stock_or_symbol: ResolvedStock | str, market: str) -> ResolvedStock:
+        if isinstance(stock_or_symbol, ResolvedStock):
+            return stock_or_symbol
+        symbol = str(stock_or_symbol or "").strip()
+        exchange = "SH" if symbol.startswith(("5", "6", "9")) else "SZ"
+        return ResolvedStock(symbol=symbol, name=symbol, exchange=exchange, market=market)
+
+    def _build_stock_data_card(
+        self,
+        stock: ResolvedStock,
+        quote: Any,
+        quote_valid: bool,
+        technical_block: str,
+        technical_valid: bool,
+        industry_block: str,
+        industry_valid: bool,
+    ) -> str:
+        quote_name = self._quote_value(quote, "name")
+        name = quote_name or stock.name or stock.symbol
+        concepts = self._extract_block_value(industry_block, "所属概念")
+        industry = self._extract_block_value(industry_block, "所属行业")
+        ma5 = self._extract_named_indicator(technical_block, "MA5")
+        ma20 = self._extract_named_indicator(technical_block, "MA20")
+        macd = self._extract_named_indicator(technical_block, "MACD")
+
+        return "\n".join([
+            "【数据卡片】",
+            f"股票名称：{name}",
+            f"股票代码：{stock.symbol}",
+            f"数据来源：{self._quote_value(quote, 'source') if quote_valid else '实时行情暂缺'}",
+            f"数据时间：{self._quote_value(quote, 'timestamp') if quote_valid else '实时行情暂缺'}",
+            f"当前价：{self._format_price(self._quote_value(quote, 'price')) if quote_valid else '实时行情暂缺'}",
+            f"涨跌幅：{self._format_pct(self._quote_value(quote, 'change_pct')) if quote_valid else '实时行情暂缺'}",
+            f"成交额：{self._format_amount(self._quote_value(quote, 'amount')) if quote_valid else '实时行情暂缺'}",
+            f"行业：{industry if industry_valid else '行业概念暂缺'}",
+            f"概念：{concepts if industry_valid else '行业概念暂缺'}",
+            (
+                f"MA5/MA20：MA5={ma5}，MA20={ma20}"
+                if technical_valid
+                else "MA5/MA20：技术指标暂缺"
+            ),
+            (
+                f"MACD：{macd}"
+                if technical_valid
+                else "MACD：技术指标暂缺"
+            ),
+        ])
+
+    @staticmethod
+    def _extract_block_value(block: str, label: str) -> str:
+        for line in str(block or "").splitlines():
+            if line.startswith(f"{label}："):
+                return line.split("：", 1)[1].strip()
+        return ""
+
+    @staticmethod
+    def _extract_named_indicator(block: str, name: str) -> str:
+        match = re.search(rf"{re.escape(name)}=([^，\n]+)", str(block or ""))
+        return match.group(1).strip() if match else "未获取到可靠数据"
+
+    @staticmethod
     def _replace_block_heading(block: str, heading: str) -> str:
         lines = str(block or "").splitlines()
         if not lines:
@@ -716,7 +771,7 @@ class MarketAgent(BaseAgent):
     def _build_stock_reply_format_rules() -> str:
         return "\n".join([
             "回复格式要求：",
-            "- 程序已直接渲染 📈 实时行情、📊 技术分析、🏭 行业属性。",
+            "- 程序已直接渲染【数据卡片】。",
             "- 你只输出以下两部分：",
             "🧠 AI综合判断",
             "⚠ 风险提示",
@@ -957,13 +1012,13 @@ class MarketAgent(BaseAgent):
         """最终回复只允许程序行情块 + 清洗后的分析文本。"""
         analysis = self._sanitize_llm_analysis(llm_response)
         if not quote_block:
-            return f"【分析】\n{analysis}"
-        if quote_block.strip().startswith("📈 实时行情"):
-            return (
+            return sanitize_text(f"【分析】\n{analysis}")
+        if quote_block.strip().startswith(("📈 实时行情", "【数据卡片】")):
+            return sanitize_text(
                 f"{quote_block.strip()}\n\n"
                 f"{self._ensure_stock_ai_sections(analysis)}"
             )
-        return f"{quote_block.strip()}\n\n【分析】\n{analysis}"
+        return sanitize_text(f"{quote_block.strip()}\n\n【分析】\n{analysis}")
 
     @staticmethod
     def _ensure_stock_ai_sections(analysis: str) -> str:
@@ -1005,7 +1060,7 @@ class MarketAgent(BaseAgent):
 
         analysis = "\n".join(cleaned).strip()
         analysis = self._strip_analysis_heading(analysis)
-        return analysis or "暂未生成有效分析内容，请以上方实时行情区为准。"
+        return sanitize_text(analysis or "暂未生成有效分析内容，请以上方实时行情区为准。")
 
     @staticmethod
     def _strip_analysis_heading(text: str) -> str:
@@ -1194,10 +1249,10 @@ class MarketAgent(BaseAgent):
 
         raw_message = str(raw_query or "").strip()
         cleaned_message = self._clean_debug_stock_query(raw_message)
-        symbol = self.market_data.extract_symbol(cleaned_message) or (
-            cleaned_message if re.fullmatch(r"\d{6}", cleaned_message) else ""
-        )
-        resolved_name = ""
+        resolve_result = self.stock_resolver.resolve(cleaned_message)
+        resolved_stock = resolve_result.stock
+        symbol = resolved_stock.symbol if resolved_stock else ""
+        resolved_name = resolved_stock.name if resolved_stock else ""
 
         quote = None
         eastmoney_error = ""
@@ -1268,10 +1323,40 @@ class MarketAgent(BaseAgent):
             if isinstance(concepts, (list, tuple))
             else ""
         )
-        final_card = (
-            self._build_quote_block(quote, quote_valid)
-            if quote is not None
-            else self._build_invalid_quote_block()
+        technical_block = self._build_unavailable_technical_block()
+        if ma is not None or macd is not None:
+            technical_block = "\n".join([
+                "【技术分析】",
+                "近60日趋势：调试命令未拉取历史K线",
+                (
+                    "均线："
+                    f"MA5={self._format_optional_number(self._value(ma, 'MA5'))}，"
+                    f"MA10={self._format_optional_number(self._value(ma, 'MA10'))}，"
+                    f"MA20={self._format_optional_number(self._value(ma, 'MA20'))}，"
+                    f"MA60={self._format_optional_number(self._value(ma, 'MA60'))}"
+                ),
+                (
+                    "MACD："
+                    f"DIF={self._format_optional_number(self._value(macd, 'DIF'))}，"
+                    f"DEA={self._format_optional_number(self._value(macd, 'DEA'))}，"
+                    f"MACD={self._format_optional_number(self._value(macd, 'MACD'))}"
+                ),
+            ])
+        industry_block = "\n".join([
+            "【行业属性】",
+            f"股票名称：{resolved_name or self._value(stock_info, 'name') or '未获取到可靠数据'}",
+            f"所属行业：{self._value(stock_info, 'industry') or '未获取到可靠数据'}",
+            f"所属概念：{concept_text or '未获取到可靠数据'}",
+        ])
+        final_card = self._build_stock_data_card(
+            resolved_stock
+            or ResolvedStock(symbol=symbol or "", name=resolved_name or "", exchange="", market="CN"),
+            quote,
+            quote_valid,
+            technical_block,
+            not bool(akshare_error) and (ma is not None or macd is not None),
+            industry_block,
+            not bool(akshare_error) and stock_info is not None,
         )
         logger.info(
             "MarketAgent debug stock data: %s",
@@ -1339,11 +1424,76 @@ class MarketAgent(BaseAgent):
         cleaned = re.sub(r"^(?:/debug|debug\s+quote)\s+", "", cleaned, flags=re.I)
         return cleaned.strip()
 
-    def _extract_focus_symbol(self, message: str, items=None) -> str:
-        symbol = self.market_data.extract_symbol(message)
-        if symbol:
-            return symbol
+    def _stock_unrecognized_response(self, session_id: str) -> AgentResponse:
+        return AgentResponse(
+            success=True,
+            agent=AgentType.MARKET,
+            message=STOCK_UNRECOGNIZED_MESSAGE,
+            metadata={
+                "session_id": session_id,
+                "data_available": False,
+                "reason": "symbol_unrecognized",
+            },
+        )
 
+    def _stock_ambiguous_response(
+        self,
+        session_id: str,
+        candidates: tuple[ResolvedStock, ...],
+    ) -> AgentResponse:
+        candidate_text = "；".join(
+            f"{item.symbol} {item.name}" for item in candidates
+        )
+        return AgentResponse(
+            success=True,
+            agent=AgentType.MARKET,
+            message=f"识别到多个匹配，请确认股票代码：{candidate_text}",
+            metadata={
+                "session_id": session_id,
+                "data_available": False,
+                "reason": "symbol_ambiguous",
+                "candidates": [item.dict() for item in candidates],
+            },
+        )
+
+    def _resolve_focus_stock(
+        self,
+        message: str,
+        items=None,
+    ) -> ResolvedStock | tuple[ResolvedStock, ...] | None:
+        result = self.stock_resolver.resolve(message)
+        if result.stock:
+            return result.stock
+        if result.candidates:
+            return result.candidates
+
+        watchlist_items = items or []
+        try:
+            if not watchlist_items:
+                watchlist_items = self.watchlist.list_stocks()
+        except WatchlistError:
+            return None
+
+        matches = [
+            ResolvedStock(
+                symbol=item.symbol,
+                name=item.name or item.symbol,
+                exchange="SH" if str(item.symbol).startswith(("5", "6", "9")) else "SZ",
+                market="CN",
+            )
+            for item in watchlist_items
+            if item.name and item.name in message
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return tuple(matches)
+        return None
+
+    def _extract_focus_symbol(self, message: str, items=None) -> str:
+        resolved = self._resolve_focus_stock(message, items)
+        if isinstance(resolved, ResolvedStock):
+            return resolved.symbol
         watchlist_items = items or []
         try:
             if not watchlist_items:
@@ -1359,7 +1509,7 @@ class MarketAgent(BaseAgent):
     def _requires_stock_resolution(self, message: str) -> bool:
         if not message or is_news_intent(message):
             return False
-        if self.market_data.extract_symbol(message):
+        if self.stock_resolver.can_resolve(message):
             return False
         if any(word in message for word in ("大盘", "市场", "板块", "行业", "主线", "热点", "自选")):
             return False

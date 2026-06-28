@@ -16,6 +16,12 @@ from src.market.service import (
     QuoteSnapshot,
     get_market_data_service,
 )
+from src.market.stock_resolver import (
+    ResolvedStock,
+    StockResolver,
+    StockResolveResult,
+    get_stock_resolver,
+)
 
 __all__ = [
     "AkShareError",
@@ -28,6 +34,10 @@ __all__ = [
     "MarketDataError",
     "MarketDataService",
     "QuoteSnapshot",
+    "ResolvedStock",
+    "StockResolver",
+    "StockResolveResult",
     "StockInfo",
     "get_market_data_service",
+    "get_stock_resolver",
 ]

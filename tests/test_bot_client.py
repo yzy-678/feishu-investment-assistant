@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 from src.bot import FeishuClient, FeishuError, get_feishu_client
+from src.bot.text_utils import sanitize_text
 
 
 # ── Mock 辅助函数 ──────────────────────────────────────
@@ -171,6 +172,30 @@ class TestSendText:
         assert sent_json["msg_type"] == "text"
         # content 应为 JSON 字符串
         assert json.loads(sent_json["content"])["text"] == "测试内容"
+        assert '"text": "测试内容"' in sent_json["content"]
+        assert "\\u6d4b" not in sent_json["content"]
+
+    @patch("httpx.Client")
+    def test_send_text_sanitizes_without_breaking_chinese(
+        self,
+        mock_client_class,
+        client,
+    ):
+        mock_cli = MagicMock()
+        mock_cli.__enter__.return_value = mock_cli
+        mock_cli.post.side_effect = [
+            token_response(),
+            send_response(),
+        ]
+        mock_client_class.return_value = mock_cli
+
+        client.send_text("ou_test", "有研新材\u200b")
+
+        send_call = mock_cli.post.call_args_list[1]
+        sent_json = send_call.kwargs["json"]
+        assert json.loads(sent_json["content"])["text"] == "有研新材"
+        bad_words = ["失" + "十", "促" + "B", "丰" + "制", chr(0x5F0A)]
+        assert not any(word in sent_json["content"] for word in bad_words)
 
     @patch("httpx.Client")
     def test_send_text_chat_id_receive_type(self, mock_client_class, client):
@@ -238,6 +263,15 @@ class TestReplyText:
         call = mock_cli.post.call_args_list[1]
         assert "messages/om_original/reply" in call.args[0]
         assert call.kwargs["json"]["msg_type"] == "text"
+
+
+def test_sanitize_text_keeps_normal_chinese_and_failure_message():
+    assert sanitize_text("有研新材") == "有研新材"
+    assert (
+        sanitize_text("实时数据获取失败，暂时无法分析")
+        == "实时数据获取失败，暂时无法分析"
+    )
+    assert sanitize_text("有研新材\u200b") == "有研新材"
 
 
 # ── send_markdown 测试 ─────────────────────────────────
