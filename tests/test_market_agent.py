@@ -266,6 +266,7 @@ class TestHandle:
         kwargs = mock_deps["deepseek"].chat_with_memory.call_args.kwargs
         assert args == ("session1", "分析平安银行")
         assert "system_messages" in kwargs
+        assert kwargs["temperature"] == 0.2
 
     def test_handle_session_id_propagation(self, mock_deps):
         """session_id 应传递到 metadata"""
@@ -331,6 +332,26 @@ class TestHandle:
         assert "LLM行业" not in resp.message
         assert "MA5=999" not in resp.message
         assert "资金偏弱" in resp.message
+
+    def test_handle_blocks_suspect_llm_garbled_text(self, mock_deps):
+        """LLM 分析段出现疑似乱码/错字时，不能直接发给用户。"""
+        garbled_a = "冲" + "啥"
+        garbled_b = chr(0x66E6) + "及"
+        garbled_c = "簿" + "仟"
+        mock_deps["deepseek"].chat_with_memory.return_value = (
+            "🧠 AI综合判断\n"
+            f"结论：短期情绪征动的加速{garbled_a}医制，{garbled_b}锡材、{garbled_c}等关键材料。\n\n"
+            "⚠ 风险提示\n"
+            "注意波动。"
+        )
+
+        resp = mock_deps["agent"].handle("session1", "分析 000001")
+
+        assert garbled_a not in resp.message
+        assert garbled_b not in resp.message
+        assert garbled_c not in resp.message
+        assert "AI 分析文本质量校验未通过" in resp.message
+        assert resp.message.startswith("【数据卡片】")
 
     def test_handle_stock_uses_akshare_data_via_market_service(self, mock_deps):
         """个股分析应通过 MarketDataService 注入 AkShare 历史/技术/行业数据。"""
@@ -520,6 +541,7 @@ class TestAnalyzeStock:
         assert "⚠ 风险提示" in result
         assert "平安银行分析结果" in result
         mock_deps["deepseek"].chat.assert_called_once()
+        assert mock_deps["deepseek"].chat.call_args.kwargs["temperature"] == 0.2
         # 验证 prompt 中包含股票代码
         messages = mock_deps["deepseek"].chat.call_args[0][0]
         assert messages[0]["role"] == "system"

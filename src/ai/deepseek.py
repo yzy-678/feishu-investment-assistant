@@ -92,6 +92,8 @@ class DeepSeekClient:
         session_id: str,
         user_message: str,
         system_messages: Optional[list[str]] = None,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
     ) -> str:
         """结合对话记忆的智能回复
 
@@ -126,7 +128,11 @@ class DeepSeekClient:
                 )
 
             # 3. 调用 AI
-            response = self.chat(context)
+            response = self.chat(
+                context,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
 
             # 4. 保存回复
             self._memory.add_message(session_id, "assistant", response)

@@ -73,6 +73,21 @@ TECHNICAL_ANALYSIS_RULES = """
 DEBUG_QUOTE_PATTERN = re.compile(r"^debug\s+quote\s+(.+)$", re.IGNORECASE)
 DEBUG_SLASH_PATTERN = re.compile(r"^/debug\s+(.+)$", re.IGNORECASE)
 
+SUSPECT_LLM_GARBLED_TERMS: tuple[str, ...] = (
+    "失" + "十",
+    "促" + "B",
+    "丰" + "制",
+    "冲" + "啥",
+    chr(0x66E6) + "及",
+    "簿" + "仟",
+    "__" + chr(0x5F0A),
+    "__",
+)
+
+SUSPECT_LLM_GARBLED_CHARS: tuple[str, ...] = (
+    chr(0x66E6),
+)
+
 
 class MarketAgent(BaseAgent):
     """市场问答 Agent
@@ -176,6 +191,7 @@ class MarketAgent(BaseAgent):
                     INVESTMENT_ASSISTANT_SYSTEM_PROMPT,
                     market_context,
                 ],
+                temperature=0.2,
             )
             response = self._compose_final_response(
                 quote_block=reply_quote_block,
@@ -247,7 +263,7 @@ class MarketAgent(BaseAgent):
         llm_response = self.deepseek.chat([
             {"role": "system", "content": INVESTMENT_ASSISTANT_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
-        ])
+        ], temperature=0.2)
         response = self._compose_final_response(quote_block, llm_response)
         logger.info("MarketAgent agent_response.message repr: %r", response)
         return response
@@ -1023,6 +1039,7 @@ class MarketAgent(BaseAgent):
     @staticmethod
     def _ensure_stock_ai_sections(analysis: str) -> str:
         text = str(analysis or "").strip()
+        text = MarketAgent._guard_llm_analysis_quality(text)
         if "🧠 AI综合判断" in text and "⚠ 风险提示" in text:
             return text
         return "\n\n".join([
@@ -1030,6 +1047,32 @@ class MarketAgent(BaseAgent):
             text or "暂未生成有效分析内容，请以上方程序数据为准。",
             "⚠ 风险提示",
             "以上仅基于程序提供的实时行情、技术指标和行业属性解读，仅供参考，不构成投资建议。",
+        ])
+
+    @staticmethod
+    def _guard_llm_analysis_quality(analysis: str) -> str:
+        """拦截 DeepSeek 分析段里的疑似乱码/形近错字输出。"""
+        text = sanitize_text(analysis).strip()
+        matched_terms = [
+            term for term in SUSPECT_LLM_GARBLED_TERMS if term and term in text
+        ]
+        matched_chars = [
+            char for char in SUSPECT_LLM_GARBLED_CHARS if char and char in text
+        ]
+        if not matched_terms and not matched_chars:
+            return text
+
+        logger.warning(
+            "MarketAgent LLM analysis quality guard triggered: terms=%s chars=%s raw=%r",
+            matched_terms,
+            matched_chars,
+            text[:500],
+        )
+        return "\n\n".join([
+            "🧠 AI综合判断",
+            "AI 分析文本质量校验未通过，已拦截疑似乱码/错字输出。请以上方程序数据卡片为准；如需继续排查，可发送“/debug 股票名称”。",
+            "⚠ 风险提示",
+            "以上仅基于程序获取的数据展示，不构成投资建议。若数据源或模型输出异常，请等待下一次查询或查看 Railway 日志。",
         ])
 
     def _sanitize_llm_analysis(self, response: str) -> str:
