@@ -28,7 +28,12 @@ from src.market import (
 )
 from src.bot.text_utils import sanitize_text
 from src.memory import ConversationMemory, get_memory
-from src.rating import InvestmentRating, get_rating_engine
+from src.rating import (
+    EastMoneyRawSectorSource,
+    InvestmentRating,
+    SectorProvider,
+    get_rating_engine,
+)
 from src.watchlist.manager import WatchlistManager, WatchlistError, get_watchlist
 
 logger = logging.getLogger(__name__)
@@ -57,7 +62,7 @@ STOCK_UNRECOGNIZED_MESSAGE = "未能识别股票，请输入股票代码，例�
 REALTIME_QUOTE_RULES = """
 行情硬规则：
 - 你不得编造任何价格、涨跌幅、成交额、时间。
-- 实时行情、技术分析、行业属性由程序直接渲染，你只输出“🧠 AI综合判断”和“⚠ 风险提示”。
+- 实时行情、技术分析、行业属性由程序直接渲染，你只输出“【核心结论】”“【3条逻辑】”“【3条风险】”。
 - 你不得输出“📈 实时行情”“📊 技术分析”“🏭 行业属性”标题，不得复述或改写当前价、涨跌幅、成交额、数据时间、MA、MACD 等指标数字。
 - 如需引用程序数据，请写“见上方实时行情/技术分析/行业属性”，不要写具体数字。
 - 如果【实时行情】显示“未获取到可靠实时行情”，不得分析今日走势、当前强弱或盘中表现。
@@ -80,7 +85,27 @@ INVESTMENT_RATING_RULES = """
 """.strip()
 
 DEBUG_QUOTE_PATTERN = re.compile(r"^debug\s+quote\s+(.+)$", re.IGNORECASE)
+DEBUG_SECTOR_PATTERN = re.compile(r"^debug\s+sector\s+(.+)$", re.IGNORECASE)
 DEBUG_SLASH_PATTERN = re.compile(r"^/debug\s+(.+)$", re.IGNORECASE)
+
+GENERAL_ASSISTANT_QUESTION_KEYWORDS: tuple[str, ...] = (
+    "信息来自哪里",
+    "数据来自哪里",
+    "来源是什么",
+    "你现在的信息",
+    "你不是接了通用型ai吗",
+    "通用型ai",
+    "通用ai",
+    "你是谁",
+    "你能做什么",
+    "你的模型",
+    "什么模型",
+    "知识库",
+    "联网",
+)
+
+BRIEF_RESPONSE_KEYWORDS: tuple[str, ...] = ("简短", "一句话", "简单说", "短一点")
+DETAILED_RESPONSE_KEYWORDS: tuple[str, ...] = ("详细分析", "长版", "展开分析", "详细一点")
 
 SUSPECT_LLM_GARBLED_TERMS: tuple[str, ...] = (
     "失" + "十",
@@ -122,6 +147,11 @@ class MarketAgent(BaseAgent):
         self.market_data = get_market_data_service()
         self.stock_resolver: StockResolver = get_stock_resolver()
         self.rating_engine = get_rating_engine()
+        self.eastmoney_raw_sector_source = EastMoneyRawSectorSource()
+        self.sector_provider = SectorProvider(
+            akshare_provider=self.market_data,
+            eastmoney_raw_source=self.eastmoney_raw_sector_source,
+        )
         self._initialized = True
         logger.info("MarketAgent initialized")
 
@@ -136,9 +166,15 @@ class MarketAgent(BaseAgent):
         if not message or not message.strip():
             return False
         msg = message.strip()
-        if DEBUG_QUOTE_PATTERN.fullmatch(msg) or DEBUG_SLASH_PATTERN.fullmatch(msg):
+        if (
+            DEBUG_QUOTE_PATTERN.fullmatch(msg)
+            or DEBUG_SECTOR_PATTERN.fullmatch(msg)
+            or DEBUG_SLASH_PATTERN.fullmatch(msg)
+        ):
             return True
         if is_news_intent(msg):
+            return False
+        if self._is_general_assistant_question(msg):
             return False
         if any(kw in msg for kw in _HANDLE_KEYWORDS):
             return True
@@ -155,6 +191,12 @@ class MarketAgent(BaseAgent):
         """
         try:
             stripped_message = message.strip()
+            sector_debug_match = DEBUG_SECTOR_PATTERN.fullmatch(stripped_message)
+            if sector_debug_match:
+                return self._handle_debug_sector(
+                    session_id,
+                    sector_debug_match.group(1),
+                )
             debug_match = (
                 DEBUG_QUOTE_PATTERN.fullmatch(stripped_message)
                 or DEBUG_SLASH_PATTERN.fullmatch(stripped_message)
@@ -200,12 +242,14 @@ class MarketAgent(BaseAgent):
                 system_messages=[
                     INVESTMENT_ASSISTANT_SYSTEM_PROMPT,
                     market_context,
+                    self._build_response_length_rules(stripped_message),
                 ],
                 temperature=0.2,
             )
             response = self._compose_final_response(
                 quote_block=reply_quote_block,
                 llm_response=llm_response,
+                response_style=self._response_style(stripped_message),
             )
             logger.info("MarketAgent agent_response.message repr: %r", response)
             self._log_final_user_data(session_id, reply_quote_block, response)
@@ -268,13 +312,18 @@ class MarketAgent(BaseAgent):
             f"你是一个专业的股票分析师。请分析股票 {symbol}（市场: {market}）。\\n\\n"
             f"{data_context}\\n\\n"
             f"{analysis_points}\\n\\n"
+            f"{self._build_response_length_rules()}\\n\\n"
             f"{self._build_data_note(market)}"
         )
         llm_response = self.deepseek.chat([
             {"role": "system", "content": INVESTMENT_ASSISTANT_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ], temperature=0.2)
-        response = self._compose_final_response(quote_block, llm_response)
+        response = self._compose_final_response(
+            quote_block,
+            llm_response,
+            response_style="normal",
+        )
         logger.info("MarketAgent agent_response.message repr: %r", response)
         return response
 
@@ -630,6 +679,30 @@ class MarketAgent(BaseAgent):
         return block
 
     def _build_industry_block_with_status(self, symbol: str) -> tuple[str, bool, str]:
+        try:
+            sector_context = self.sector_provider.get_sector_context(symbol)
+        except Exception as exc:
+            logger.warning(
+                "MarketAgent SectorProvider unavailable: symbol=%s error=%s",
+                symbol,
+                exc,
+            )
+            sector_context = None
+
+        if sector_context is not None and sector_context.available:
+            concept_text = (
+                "、".join(str(item) for item in sector_context.concepts if item)
+                if sector_context.concepts
+                else "数据暂不可用"
+            )
+            block = "\n".join([
+                "【行业属性】",
+                f"股票名称：{sector_context.name or '数据暂不可用'}",
+                f"所属行业：{sector_context.industry or '数据暂不可用'}",
+                f"所属概念：{concept_text}",
+            ])
+            return block, True, ""
+
         stock_info = self._safe_market_data_call(
             "stock_info",
             symbol,
@@ -696,15 +769,13 @@ class MarketAgent(BaseAgent):
             return ["stock_info_empty"]
 
         reasons: list[str] = []
-        if self._value(stock_info, "name") in (None, ""):
-            reasons.append("stock_info_missing_name")
-        if self._value(stock_info, "industry") in (None, ""):
-            reasons.append("stock_info_missing_industry")
+        has_industry = self._value(stock_info, "industry") not in (None, "")
         concepts = self._value(stock_info, "concepts")
-        if not isinstance(concepts, (list, tuple)) or not [
+        has_concepts = isinstance(concepts, (list, tuple)) and bool([
             item for item in concepts if item
-        ]:
-            reasons.append("stock_info_missing_concepts")
+        ])
+        if not has_industry and not has_concepts:
+            reasons.append("stock_info_missing_industry_and_concepts")
         return reasons
 
     @staticmethod
@@ -876,10 +947,43 @@ class MarketAgent(BaseAgent):
         return "\n".join([
             "回复格式要求：",
             "- 程序已直接渲染【数据卡片】。",
-            "- 你只输出以下两部分：",
-            "🧠 AI综合判断",
-            "⚠ 风险提示",
+            "- 默认输出控制在 600~900 字，适合飞书阅读。",
+            "- 你只输出以下三部分：",
+            "【核心结论】",
+            "【3条逻辑】",
+            "【3条风险】",
+            "- 3条逻辑和3条风险必须各自控制为3条，避免长篇研报式展开。",
             "- 可以解释“📊 AI Investment Rating”的分数来源，但不得修改任何分数。",
+        ])
+
+    @staticmethod
+    def _response_style(message: str = "") -> str:
+        normalized = str(message or "").strip().lower()
+        if any(keyword in normalized for keyword in BRIEF_RESPONSE_KEYWORDS):
+            return "brief"
+        if any(keyword in normalized for keyword in DETAILED_RESPONSE_KEYWORDS):
+            return "detailed"
+        return "normal"
+
+    @classmethod
+    def _build_response_length_rules(cls, message: str = "") -> str:
+        style = cls._response_style(message)
+        if style == "brief":
+            return "\n".join([
+                "回复长度要求：用户要求简短/一句话。",
+                "- 个股分析控制在 200 字以内。",
+                "- 只给核心结论和最主要风险，不展开长篇逻辑。",
+            ])
+        if style == "detailed":
+            return "\n".join([
+                "回复长度要求：用户要求详细分析。",
+                "- 可以输出长版分析，但仍不得复述或编造程序数据。",
+                "- 仍需保留：数据卡片、Investment Rating、核心结论、逻辑、风险。",
+            ])
+        return "\n".join([
+            "回复长度要求：默认个股分析控制在 600~900 字。",
+            "- 输出结构固定为：数据卡片、Investment Rating、核心结论、3条逻辑、3条风险。",
+            "- 删除重复解释，不写长篇研报式内容。",
         ])
 
     def _safe_market_data_call(
@@ -980,7 +1084,7 @@ class MarketAgent(BaseAgent):
         if quote_valid:
             return (
                 "分析要点：\n"
-                "1. 只输出“🧠 AI综合判断”和“⚠ 风险提示”两部分\n"
+                "1. 只输出“【核心结论】”“【3条逻辑】”“【3条风险】”三部分\n"
                 "2. 解释程序提供的【实时行情】【技术分析】【行业属性】\n"
                 "3. 不计算 MA、MACD、趋势涨跌幅等指标\n"
                 "4. 不编造任何指标、行业、概念或实时行情数字\n"
@@ -988,7 +1092,7 @@ class MarketAgent(BaseAgent):
             )
         return (
             "分析要点：\n"
-            "1. 只输出“🧠 AI综合判断”和“⚠ 风险提示”两部分\n"
+            "1. 只输出“【核心结论】”“【3条逻辑】”“【3条风险】”三部分\n"
             "2. 先说明未获取到可靠实时行情\n"
             "3. 只解释程序提供的【技术分析】【行业属性】可用数据\n"
             "4. 不计算或编造任何指标\n"
@@ -1113,30 +1217,61 @@ class MarketAgent(BaseAgent):
         except (TypeError, ValueError):
             return str(value)
 
-    def _compose_final_response(self, quote_block: str, llm_response: str) -> str:
+    def _compose_final_response(
+        self,
+        quote_block: str,
+        llm_response: str,
+        response_style: str = "normal",
+    ) -> str:
         """最终回复只允许程序行情块 + 清洗后的分析文本。"""
         analysis = self._sanitize_llm_analysis(llm_response)
+        analysis = self._limit_analysis_text(analysis, response_style)
         if not quote_block:
             return sanitize_text(f"【分析】\n{analysis}")
         if quote_block.strip().startswith(("📈 实时行情", "【数据卡片】")):
             return sanitize_text(
                 f"{quote_block.strip()}\n\n"
-                f"{self._ensure_stock_ai_sections(analysis)}"
+                f"{self._ensure_stock_ai_sections(analysis, response_style)}"
             )
         return sanitize_text(f"{quote_block.strip()}\n\n【分析】\n{analysis}")
 
     @staticmethod
-    def _ensure_stock_ai_sections(analysis: str) -> str:
+    def _ensure_stock_ai_sections(analysis: str, response_style: str = "normal") -> str:
         text = str(analysis or "").strip()
         text = MarketAgent._guard_llm_analysis_quality(text)
+        if response_style == "brief":
+            if "【核心结论】" in text:
+                return text
+            return "\n\n".join([
+                "【核心结论】",
+                text or "暂未生成有效分析内容，请以上方程序数据为准。",
+                "【3条风险】",
+                "1. 以上仅基于程序提供的数据解读，不构成投资建议。",
+            ])
+        if all(section in text for section in ("【核心结论】", "【3条逻辑】", "【3条风险】")):
+            return text
         if "🧠 AI综合判断" in text and "⚠ 风险提示" in text:
             return text
         return "\n\n".join([
-            "🧠 AI综合判断",
+            "【核心结论】",
             text or "暂未生成有效分析内容，请以上方程序数据为准。",
-            "⚠ 风险提示",
-            "以上仅基于程序提供的实时行情、技术指标和行业属性解读，仅供参考，不构成投资建议。",
+            "【3条逻辑】",
+            "1. 以上方数据卡片和 Investment Rating 为准。",
+            "2. AI 只解释程序评分，不修改分数。",
+            "3. 数据缺失项不做推断。",
+            "【3条风险】",
+            "1. 当前评级仅基于已接入的行情、技术和量价数据。",
+            "2. 未接入新闻、公告、财报和完整资金流数据。",
+            "3. 以上仅供观察，不构成买卖建议。",
         ])
+
+    @staticmethod
+    def _limit_analysis_text(analysis: str, response_style: str) -> str:
+        text = str(analysis or "").strip()
+        limit = 180 if response_style == "brief" else 900
+        if response_style == "detailed" or len(text) <= limit:
+            return text
+        return text[:limit].rstrip() + "..."
 
     @staticmethod
     def _guard_llm_analysis_quality(analysis: str) -> str:
@@ -1158,10 +1293,10 @@ class MarketAgent(BaseAgent):
             text[:500],
         )
         return "\n\n".join([
-            "🧠 AI综合判断",
+            "【核心结论】",
             "AI 分析文本质量校验未通过，已拦截疑似乱码/错字输出。请以上方程序数据卡片为准；如需继续排查，可发送“/debug 股票名称”。",
-            "⚠ 风险提示",
-            "以上仅基于程序获取的数据展示，不构成投资建议。若数据源或模型输出异常，请等待下一次查询或查看 Railway 日志。",
+            "【3条风险】",
+            "1. 以上仅基于程序获取的数据展示，不构成投资建议。若数据源或模型输出异常，请等待下一次查询或查看 Railway 日志。",
         ])
 
     def _sanitize_llm_analysis(self, response: str) -> str:
@@ -1512,10 +1647,109 @@ class MarketAgent(BaseAgent):
             },
         )
 
+    def _handle_debug_sector(self, session_id: str, raw_query: str) -> AgentResponse:
+        admin_open_id = settings.admin_user_open_id.strip()
+        if not admin_open_id or session_id.strip() != admin_open_id:
+            logger.warning(
+                "Sector debug denied: session=%s raw_query=%s",
+                session_id[:8],
+                raw_query,
+            )
+            return AgentResponse(
+                success=False,
+                agent=AgentType.MARKET,
+                message="无权使用板块调试命令。",
+                metadata={"type": "sector_debug", "authorized": False},
+            )
+
+        raw_message = str(raw_query or "").strip()
+        cleaned_message = self._clean_debug_stock_query(raw_message)
+        resolve_result = self.stock_resolver.resolve(cleaned_message)
+        resolved_stock = resolve_result.stock
+        symbol = resolved_stock.symbol if resolved_stock else ""
+        resolved_name = resolved_stock.name if resolved_stock else ""
+
+        if not symbol:
+            return AgentResponse(
+                success=True,
+                agent=AgentType.MARKET,
+                message="【Sector Debug】\n未能识别股票，请输入股票代码，例如 debug sector 003031。",
+                metadata={
+                    "type": "sector_debug",
+                    "symbol": "",
+                    "available": False,
+                    "reason": "symbol_unrecognized",
+                },
+            )
+
+        try:
+            context = self.sector_provider.get_sector_context(symbol)
+        except Exception as exc:
+            logger.warning(
+                "Sector debug provider failed: symbol=%s error=%s",
+                symbol,
+                exc,
+            )
+            context = None
+
+        snapshot: dict[str, Any] = {}
+        debug_source = getattr(self.eastmoney_raw_sector_source, "debug_snapshot", None)
+        if callable(debug_source):
+            try:
+                snapshot = debug_source(symbol)
+            except Exception as exc:
+                logger.warning(
+                    "Sector debug raw snapshot failed: symbol=%s error=%s",
+                    symbol,
+                    exc,
+                )
+                snapshot = {"error_type": type(exc).__name__, "error": str(exc)}
+
+        industry = context.industry if context is not None else ""
+        concepts = context.concepts if context is not None else []
+        provider = (
+            context.data_source
+            if context is not None and context.data_source
+            else str(snapshot.get("provider") or "数据暂不可用")
+        )
+        raw_summary = json.dumps(snapshot, ensure_ascii=False, default=str)
+        if len(raw_summary) > 900:
+            raw_summary = raw_summary[:900].rstrip() + "..."
+
+        reply = "\n".join([
+            "【Sector Debug】",
+            f"股票代码：{symbol}",
+            f"股票名称：{resolved_name or (context.name if context is not None else '')}",
+            f"industry：{industry or '数据暂不可用'}",
+            f"concepts：{'、'.join(concepts) if concepts else '数据暂不可用'}",
+            f"provider：{provider}",
+            f"available：{'true' if context is not None and context.available else 'false'}",
+            f"industry_available：{'true' if context is not None and context.industry_available else 'false'}",
+            f"concepts_available：{'true' if context is not None and context.concepts_available else 'false'}",
+            "raw_response 摘要：",
+            raw_summary,
+        ])
+        return AgentResponse(
+            success=True,
+            agent=AgentType.MARKET,
+            message=reply,
+            metadata={
+                "type": "sector_debug",
+                "symbol": symbol,
+                "available": context.available if context is not None else False,
+                "provider": provider,
+            },
+        )
+
     @staticmethod
     def _clean_debug_stock_query(raw_query: str) -> str:
         cleaned = str(raw_query or "").strip()
-        cleaned = re.sub(r"^(?:/debug|debug\s+quote)\s+", "", cleaned, flags=re.I)
+        cleaned = re.sub(
+            r"^(?:/debug|debug\s+quote|debug\s+sector)\s+",
+            "",
+            cleaned,
+            flags=re.I,
+        )
         return cleaned.strip()
 
     def _stock_unrecognized_response(self, session_id: str) -> AgentResponse:
@@ -1603,6 +1837,8 @@ class MarketAgent(BaseAgent):
     def _requires_stock_resolution(self, message: str) -> bool:
         if not message or is_news_intent(message):
             return False
+        if self._is_general_assistant_question(message):
+            return False
         if self.stock_resolver.can_resolve(message):
             return False
         if any(word in message for word in ("大盘", "市场", "板块", "行业", "主线", "热点", "自选")):
@@ -1617,6 +1853,8 @@ class MarketAgent(BaseAgent):
     def _looks_like_stock_name_query(message: str) -> bool:
         cleaned = re.sub(r"\s+", "", str(message or "").strip())
         if not cleaned or len(cleaned) > 12:
+            return False
+        if MarketAgent._is_general_assistant_question(cleaned):
             return False
         if cleaned in {
             "你好",
@@ -1634,6 +1872,13 @@ class MarketAgent(BaseAgent):
         if any(word in cleaned for word in ("启动", "暂停", "状态", "系统")):
             return False
         return bool(re.search(r"[\u4e00-\u9fff]{2,}", cleaned))
+
+    @staticmethod
+    def _is_general_assistant_question(message: str) -> bool:
+        normalized = re.sub(r"\s+", "", str(message or "").strip().lower())
+        if not normalized:
+            return False
+        return any(keyword in normalized for keyword in GENERAL_ASSISTANT_QUESTION_KEYWORDS)
 
 
 # ── 全局单例访问函数 ─────────────────────────────────────

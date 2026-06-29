@@ -32,6 +32,7 @@ from src.market import (
     StockInfo,
 )
 from src.rating import DataQualityItem, DataQualityReport, InvestmentRating, RatingLevel
+from src.rating import SectorContext, SectorProvider
 
 
 # ── 辅助: 创建测试用自选股 ─────────────────────────────
@@ -189,6 +190,23 @@ def mock_deps():
         mock_rating_engine.return_value = mock_rating_engine_instance
 
         agent = MarketAgent()
+        agent.sector_provider = SectorProvider(akshare_provider=mock_mds_instance)
+        agent.eastmoney_raw_sector_source = SimpleNamespace(
+            debug_snapshot=lambda symbol: {
+                "provider": "EastMoneyRawSectorSource",
+                "symbol": symbol,
+                "stock_get": {
+                    "status_code": 200,
+                    "f127_industry": "银行",
+                    "f128_region_sector": "广东板块",
+                },
+                "hot_keyword": {
+                    "status_code": 200,
+                    "row_count": 2,
+                    "concepts": ["互联金融", "破净股"],
+                },
+            }
+        )
         yield {
             "agent": agent,
             "deepseek": mock_ds_instance,
@@ -231,8 +249,18 @@ class TestCanHandle:
 
     def test_can_handle_debug_quote(self, mock_deps):
         assert mock_deps["agent"].can_handle("debug quote 300136")
+        assert mock_deps["agent"].can_handle("debug sector 003031")
         assert mock_deps["agent"].can_handle("debug quote 有研新材")
         assert mock_deps["agent"].can_handle("/debug 有研新材")
+
+    @pytest.mark.parametrize("msg", [
+        "你现在的信息来自哪里",
+        "你不是接了通用型AI吗",
+        "你是谁",
+        "你能做什么",
+    ])
+    def test_can_handle_general_ai_questions_fall_through(self, mock_deps, msg: str):
+        assert not mock_deps["agent"].can_handle(msg)
 
     def test_can_handle_bare_stock_name_after_symbol_resolution(self, mock_deps):
         assert mock_deps["agent"].can_handle("有研新材")
@@ -341,10 +369,26 @@ class TestHandle:
         assert "变化：⬆ +4" in resp.message
         assert "✓ 放量突破/结构改善" in resp.message
         assert "当前评级仅基于已接入的行情、技术和量价数据" in resp.message
-        assert "🧠 AI综合判断" in resp.message
-        assert "⚠ 风险提示" in resp.message
+        assert "【核心结论】" in resp.message
+        assert "【3条逻辑】" in resp.message
+        assert "【3条风险】" in resp.message
         assert "AI 只负责解读" in resp.message
         mock_deps["rating_engine"].evaluate.assert_called_with("000001")
+
+    def test_stock_prompt_uses_default_feishu_length_structure(self, mock_deps):
+        mock_deps["agent"].handle("session1", "分析 000001")
+
+        kwargs = mock_deps["deepseek"].chat_with_memory.call_args.kwargs
+        system_text = "\n".join(kwargs["system_messages"])
+        assert "默认个股分析控制在 600~900 字" in system_text
+        assert "数据卡片、Investment Rating、核心结论、3条逻辑、3条风险" in system_text
+
+    def test_stock_prompt_uses_brief_length_when_requested(self, mock_deps):
+        mock_deps["agent"].handle("session1", "简短分析 000001")
+
+        kwargs = mock_deps["deepseek"].chat_with_memory.call_args.kwargs
+        system_text = "\n".join(kwargs["system_messages"])
+        assert "个股分析控制在 200 字以内" in system_text
 
     def test_rating_block_displays_missing_sector_as_not_included(self):
         rating = InvestmentRating(
@@ -586,6 +630,53 @@ class TestHandle:
         )
         mock_deps["deepseek"].chat_with_memory.assert_not_called()
 
+    def test_admin_can_debug_sector_without_calling_deepseek(self, mock_deps):
+        mock_deps["agent"].sector_provider = SimpleNamespace(
+            get_sector_context=lambda symbol: SectorContext(
+                name="中瓷电子",
+                industry="通信设备",
+                concepts=["先进封装", "商业航天"],
+                data_source="EastMoneyRaw, EastMoneyHotKeyword",
+            )
+        )
+        mock_deps["agent"].eastmoney_raw_sector_source = SimpleNamespace(
+            debug_snapshot=lambda symbol: {
+                "provider": "EastMoneyRawSectorSource",
+                "symbol": symbol,
+                "stock_get": {
+                    "status_code": 200,
+                    "f58_name": "中瓷电子",
+                    "f127_industry": "通信设备",
+                    "f128_region_sector": "河北板块",
+                },
+                "hot_keyword": {
+                    "status_code": 200,
+                    "row_count": 2,
+                    "concepts": ["先进封装", "商业航天"],
+                },
+            }
+        )
+
+        with patch(
+            "src.agents.market_agent.settings.admin_user_open_id",
+            "ou_admin",
+        ):
+            resp = mock_deps["agent"].handle(
+                "ou_admin",
+                "debug sector 003031",
+            )
+
+        assert resp.success is True
+        assert "【Sector Debug】" in resp.message
+        assert "股票代码：003031" in resp.message
+        assert "industry：通信设备" in resp.message
+        assert "concepts：先进封装、商业航天" in resp.message
+        assert "provider：EastMoneyRaw, EastMoneyHotKeyword" in resp.message
+        assert "available：true" in resp.message
+        assert "raw_response 摘要" in resp.message
+        assert "f127_industry" in resp.message
+        mock_deps["deepseek"].chat_with_memory.assert_not_called()
+
     def test_non_admin_cannot_debug_quote(self, mock_deps):
         with patch(
             "src.agents.market_agent.settings.admin_user_open_id",
@@ -719,8 +810,9 @@ class TestAnalyzeStock:
         assert "当前价：10.52" in result
         assert "MA5/MA20：MA5=10.8000，MA20=10.5500" in result
         assert "行业：银行" in result
-        assert "🧠 AI综合判断" in result
-        assert "⚠ 风险提示" in result
+        assert "【核心结论】" in result
+        assert "【3条逻辑】" in result
+        assert "【3条风险】" in result
         assert "平安银行分析结果" in result
         mock_deps["deepseek"].chat.assert_called_once()
         assert mock_deps["deepseek"].chat.call_args.kwargs["temperature"] == 0.2
@@ -940,6 +1032,25 @@ class TestAnalyzeStock:
         result = mock_deps["agent"].analyze_stock("000001")
 
         assert "行业：银行" in result
+        assert "概念：数据暂不可用" in result
+        assert "行业概念暂缺" not in result
+
+    def test_stock_analysis_uses_sector_provider_for_visible_industry(
+        self,
+        mock_deps,
+    ):
+        mock_deps["agent"].sector_provider = SimpleNamespace(
+            get_sector_context=lambda symbol: SectorContext(
+                name="中瓷电子",
+                industry="通信设备",
+                concepts=[],
+                data_source="EastMoneyRaw",
+            )
+        )
+
+        result = mock_deps["agent"].analyze_stock("003031")
+
+        assert "行业：通信设备" in result
         assert "概念：数据暂不可用" in result
         assert "行业概念暂缺" not in result
 

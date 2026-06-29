@@ -89,6 +89,86 @@ class EastMoneyRawSectorSource:
             ),
         )
 
+    def debug_snapshot(self, symbol: str) -> dict[str, Any]:
+        """Return a compact raw endpoint snapshot for operator diagnostics."""
+        market_code = "1" if str(symbol).startswith(("6", "688")) else "0"
+        prefixed_symbol = to_eastmoney_security_code(symbol)
+        snapshot: dict[str, Any] = {
+            "provider": "EastMoneyRawSectorSource",
+            "symbol": symbol,
+            "prefixed_symbol": prefixed_symbol,
+            "stock_get": {},
+            "hot_keyword": {},
+        }
+
+        try:
+            response = self._get(
+                EASTMONEY_STOCK_URL,
+                params={
+                    "fltt": "2",
+                    "invt": "2",
+                    "fields": "f57,f58,f127,f128",
+                    "secid": f"{market_code}.{symbol}",
+                },
+            )
+            status_code = getattr(response, "status_code", "")
+            payload = response.json() or {}
+            data = payload.get("data") or {}
+            snapshot["stock_get"] = {
+                "status_code": status_code,
+                "has_data": bool(data),
+                "f58_name": data.get("f58"),
+                "f127_industry": data.get("f127"),
+                "f128_region_sector": data.get("f128"),
+                "raw_keys": list(data.keys())[:12] if isinstance(data, dict) else [],
+            }
+        except Exception as exc:
+            logger.warning(
+                "EastMoney raw sector debug industry failed: symbol=%s error=%s",
+                symbol,
+                exc,
+            )
+            snapshot["stock_get"] = {
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+
+        try:
+            response = self._post(
+                EASTMONEY_HOT_KEYWORD_URL,
+                json={
+                    "appId": "appId01",
+                    "globalId": "786e4c21-70dc-435a-93bb-38",
+                    "srcSecurityCode": prefixed_symbol,
+                },
+            )
+            status_code = getattr(response, "status_code", "")
+            rows = (response.json() or {}).get("data") or []
+            concepts = [
+                str(row.get("conceptName") or "").strip()
+                for row in rows
+                if isinstance(row, dict) and row.get("conceptName")
+            ]
+            snapshot["hot_keyword"] = {
+                "status_code": status_code,
+                "row_count": len(rows) if isinstance(rows, list) else 0,
+                "concepts": concepts[:8],
+            }
+        except Exception as exc:
+            logger.warning(
+                "EastMoney raw sector debug concepts failed: symbol=%s "
+                "prefixed=%s error=%s",
+                symbol,
+                prefixed_symbol,
+                exc,
+            )
+            snapshot["hot_keyword"] = {
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+
+        return snapshot
+
     def _fetch_industry(self, symbol: str) -> SectorContext:
         market_code = "1" if str(symbol).startswith(("6", "688")) else "0"
         try:
