@@ -171,9 +171,8 @@ class InvestmentRatingEngine:
             sector_available=_sector_scoring_available(sector_context),
         )
         breakdown = self.score_calculator.calculate(input_data)
-        warnings = [
-            item
-            for item in [
+        warnings = _normalize_user_warnings(
+            [
                 quote_warning,
                 history_warning,
                 info_warning,
@@ -182,8 +181,7 @@ class InvestmentRatingEngine:
                 *breakdown.warnings,
                 RATING_DATA_SCOPE_WARNING,
             ]
-            if item
-        ]
+        )
         total_score = breakdown.total_score
         rating_date = shanghai_today().isoformat()
         previous = self._get_previous_rating(normalized_symbol, rating_date)
@@ -436,6 +434,19 @@ def _quality_item_from_result(
         fallback=bool(metadata.get("fallback")),
         included=included and result.ok,
     )
+
+
+def _normalize_user_warnings(raw_warnings: list[str]) -> list[str]:
+    """Keep rating warnings user-facing and avoid duplicate internal wording."""
+    normalized: list[str] = []
+    for warning in raw_warnings:
+        text = str(warning or "").strip()
+        if not text:
+            continue
+        text = text.replace("行业涨跌幅数据不足", "行业相对强度暂未纳入")
+        if text not in normalized:
+            normalized.append(text)
+    return normalized
 
 
 def _quality_item_from_source_entry(

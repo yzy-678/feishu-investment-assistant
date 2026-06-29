@@ -588,6 +588,31 @@ def test_rating_engine_evaluate_returns_unified_investment_rating():
     assert "future_extensions" in rating.reserved
 
 
+def test_rating_warning_uses_user_facing_relative_strength_wording():
+    market_data = FakeMarketData(
+        quote=make_quote(change_pct=2.0),
+        history=trend_history(25),
+        stock_info=StockInfo(symbol="300001", name="测试科技"),
+        index_quotes=[make_quote(symbol="000001", name="上证指数", change_pct=1.0)],
+    )
+
+    rating = InvestmentRatingEngine(
+        market_data=market_data,
+        sector_provider=FakeSectorContextProvider(
+            context=SectorContext(
+                industry="通信设备",
+                concepts=["半导体概念"],
+                data_source="EastMoneyRaw",
+            )
+        ),
+        persist_history=False,
+    ).evaluate("300001")
+
+    assert "行业涨跌幅数据不足" not in rating.warning
+    assert "行业涨跌幅数据尚未接入" not in rating.warning
+    assert "行业相对强度维度暂未纳入" in rating.warning
+
+
 def test_rating_engine_handles_missing_data_without_inventing_scores():
     market_data = FakeMarketData(
         quote=RuntimeError("quote unavailable"),

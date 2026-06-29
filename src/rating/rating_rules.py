@@ -232,7 +232,7 @@ def calculate_strength_score(data: RatingInputData) -> tuple[float, list[str], l
         )
 
     if data.industry_change_pct is None:
-        warnings.append("行业涨跌幅数据不足")
+        warnings.append("行业相对强度维度暂未纳入")
     elif quote.change_pct > data.industry_change_pct:
         score += 5
         evidence.append(
