@@ -27,6 +27,17 @@ class ProviderStatus(str, Enum):
 
 
 @dataclass(frozen=True)
+class ProviderConfig:
+    """Runtime options every market data provider must expose."""
+
+    data_source: str
+    timeout: float = 8.0
+    cache_enabled: bool = True
+    fallback_priority: int = 100
+    cache_ttl_seconds: float = 60.0
+
+
+@dataclass(frozen=True)
 class ProviderResult(Generic[T]):
     """Result wrapper for all data providers."""
 
@@ -112,6 +123,37 @@ class ProviderResult(Generic[T]):
             error_type="timeout",
             metadata=metadata or {},
         )
+
+
+class BaseProvider(Protocol):
+    """Standard provider interface used by ProviderManager."""
+
+    config: ProviderConfig
+    data_source: str
+    fallback_priority: int
+    timeout: float
+    cache_enabled: bool
+
+    def get_quote(self, symbol: str) -> ProviderResult[Any]:
+        ...
+
+    def get_kline(self, symbol: str, period: int = 60) -> ProviderResult[Any]:
+        ...
+
+    def get_sector(self, symbol: str) -> ProviderResult[Any]:
+        ...
+
+    def get_concepts(self, symbol: str) -> ProviderResult[list[str]]:
+        ...
+
+    def get_fund_flow(self, symbol: str) -> ProviderResult[Any]:
+        ...
+
+    def get_news(self, symbol: str) -> ProviderResult[list[Any]]:
+        ...
+
+    def health_check(self) -> ProviderResult[dict[str, Any]]:
+        ...
 
 
 class KlineProvider(Protocol):

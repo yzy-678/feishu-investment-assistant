@@ -7,6 +7,11 @@ import sqlite3
 from typing import Optional, Protocol
 
 from src.db import get_database
+from src.market.aggregator import (
+    MarketDataAggregator,
+    MarketDataSnapshot,
+    get_market_data_aggregator,
+)
 from src.market.akshare_source import HistoryBar, StockInfo
 from src.market.service import MarketDataError, QuoteSnapshot, get_market_data_service
 from src.providers import (
@@ -71,10 +76,19 @@ class InvestmentRatingEngine:
         sector_provider: Optional[RatingSectorSource] = None,
         kline_provider: Optional[KlineProvider] = None,
         rating_sector_provider: Optional[UnifiedSectorProvider] = None,
+        aggregator: Optional[MarketDataAggregator] = None,
         cache_manager: Optional[CacheManager] = None,
         persist_history: bool = True,
     ) -> None:
-        using_default_market_data = market_data is None
+        using_default_market_data = (
+            market_data is None
+            and sector_provider is None
+            and kline_provider is None
+            and rating_sector_provider is None
+        )
+        self.aggregator = aggregator or (
+            get_market_data_aggregator() if using_default_market_data else None
+        )
         self.market_data = market_data or get_market_data_service()
         self.score_calculator = score_calculator or InvestmentScoreCalculator()
         self.sector_provider = sector_provider or RatingSectorSource(
@@ -113,15 +127,31 @@ class InvestmentRatingEngine:
     def evaluate(self, symbol: str) -> InvestmentRating:
         """Evaluate a stock with truthful market data and deterministic rules."""
         normalized_symbol = symbol.strip().upper()
-        quote, quote_warning = self._safe_get_quote(normalized_symbol)
-        history, history_warning, history_quality = self._safe_get_history(
-            normalized_symbol
-        )
-        stock_info, info_warning = self._safe_get_stock_info(normalized_symbol)
-        sector_context, sector_quality = self._safe_get_sector_context(
-            normalized_symbol
-        )
-        index_change_pct, index_warning = self._safe_get_index_change_pct()
+        if self.aggregator is not None:
+            snapshot = self.aggregator.get_snapshot(normalized_symbol, period=60)
+            (
+                quote,
+                quote_warning,
+                history,
+                history_warning,
+                history_quality,
+                stock_info,
+                info_warning,
+                sector_context,
+                sector_quality,
+                index_change_pct,
+                index_warning,
+            ) = self._rating_data_from_snapshot(snapshot)
+        else:
+            quote, quote_warning = self._safe_get_quote(normalized_symbol)
+            history, history_warning, history_quality = self._safe_get_history(
+                normalized_symbol
+            )
+            stock_info, info_warning = self._safe_get_stock_info(normalized_symbol)
+            sector_context, sector_quality = self._safe_get_sector_context(
+                normalized_symbol
+            )
+            index_change_pct, index_warning = self._safe_get_index_change_pct()
 
         input_data = RatingInputData(
             symbol=normalized_symbol,
@@ -210,6 +240,50 @@ class InvestmentRatingEngine:
         )
         self._save_rating_snapshot(rating, rating_date)
         return rating
+
+    def _rating_data_from_snapshot(
+        self,
+        snapshot: MarketDataSnapshot,
+    ) -> tuple[
+        Optional[QuoteSnapshot],
+        str,
+        list[HistoryBar],
+        str,
+        DataQualityItem,
+        Optional[StockInfo],
+        str,
+        SectorContext,
+        DataQualityItem,
+        float,
+        str,
+    ]:
+        source_map = snapshot.source_map
+        quote_entry = source_map.get("quote", {})
+        kline_entry = source_map.get("kline", {})
+        sector_entry = source_map.get("sector", {})
+        index_entry = source_map.get("index", {})
+
+        quote = snapshot.quote if _entry_included(quote_entry) else None
+        history = list(snapshot.kline)
+        stock_info = snapshot.stock_info
+        sector_context = snapshot.sector
+        return (
+            quote,
+            "" if quote else quote_entry.get("message", "实时行情不可用"),
+            history,
+            "" if history else kline_entry.get("message", "历史K线为空"),
+            _quality_item_from_source_entry("历史K线", kline_entry, included=bool(history)),
+            stock_info,
+            "" if (stock_info.name or stock_info.industry or stock_info.concepts) else "股票基础信息不完整",
+            sector_context,
+            _quality_item_from_source_entry(
+                "板块上下文",
+                sector_entry,
+                included=sector_context.available,
+            ),
+            snapshot.index_change_pct,
+            "" if _entry_included(index_entry) else index_entry.get("message", "指数行情不可用"),
+        )
 
     def _safe_get_quote(
         self,
@@ -362,6 +436,27 @@ def _quality_item_from_result(
         fallback=bool(metadata.get("fallback")),
         included=included and result.ok,
     )
+
+
+def _quality_item_from_source_entry(
+    name: str,
+    entry: dict,
+    *,
+    included: bool,
+) -> DataQualityItem:
+    return DataQualityItem(
+        name=name,
+        source=str(entry.get("source") or "ProviderManager"),
+        status=str(entry.get("status") or "failed"),
+        message=str(entry.get("message") or ""),
+        cache_hit=bool(entry.get("cache_hit")),
+        fallback=bool(entry.get("fallback")),
+        included=included and _entry_included(entry),
+    )
+
+
+def _entry_included(entry: dict) -> bool:
+    return str(entry.get("status") or "") in {"success", "partial", "cache"}
 
 
 def _data_quality_report(

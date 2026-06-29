@@ -28,12 +28,8 @@ from src.market import (
 )
 from src.bot.text_utils import sanitize_text
 from src.memory import ConversationMemory, get_memory
-from src.rating import (
-    EastMoneyRawSectorSource,
-    InvestmentRating,
-    SectorProvider,
-    get_rating_engine,
-)
+from src.providers.provider_manager import get_provider_manager
+from src.rating import InvestmentRating, get_rating_engine
 from src.watchlist.manager import WatchlistManager, WatchlistError, get_watchlist
 
 logger = logging.getLogger(__name__)
@@ -147,11 +143,7 @@ class MarketAgent(BaseAgent):
         self.market_data = get_market_data_service()
         self.stock_resolver: StockResolver = get_stock_resolver()
         self.rating_engine = get_rating_engine()
-        self.eastmoney_raw_sector_source = EastMoneyRawSectorSource()
-        self.sector_provider = SectorProvider(
-            akshare_provider=self.market_data,
-            eastmoney_raw_source=self.eastmoney_raw_sector_source,
-        )
+        self.provider_manager = get_provider_manager()
         self._initialized = True
         logger.info("MarketAgent initialized")
 
@@ -680,10 +672,11 @@ class MarketAgent(BaseAgent):
 
     def _build_industry_block_with_status(self, symbol: str) -> tuple[str, bool, str]:
         try:
-            sector_context = self.sector_provider.get_sector_context(symbol)
+            sector_result = self.provider_manager.get_sector(symbol)
+            sector_context = sector_result.data
         except Exception as exc:
             logger.warning(
-                "MarketAgent SectorProvider unavailable: symbol=%s error=%s",
+                "MarketAgent ProviderManager sector unavailable: symbol=%s error=%s",
                 symbol,
                 exc,
             )
@@ -1683,7 +1676,8 @@ class MarketAgent(BaseAgent):
             )
 
         try:
-            context = self.sector_provider.get_sector_context(symbol)
+            sector_result = self.provider_manager.get_sector(symbol)
+            context = sector_result.data
         except Exception as exc:
             logger.warning(
                 "Sector debug provider failed: symbol=%s error=%s",
@@ -1693,7 +1687,7 @@ class MarketAgent(BaseAgent):
             context = None
 
         snapshot: dict[str, Any] = {}
-        debug_source = getattr(self.eastmoney_raw_sector_source, "debug_snapshot", None)
+        debug_source = self._sector_debug_snapshot_source()
         if callable(debug_source):
             try:
                 snapshot = debug_source(symbol)
@@ -1712,6 +1706,7 @@ class MarketAgent(BaseAgent):
             if context is not None and context.data_source
             else str(snapshot.get("provider") or "数据暂不可用")
         )
+
         raw_summary = json.dumps(snapshot, ensure_ascii=False, default=str)
         if len(raw_summary) > 900:
             raw_summary = raw_summary[:900].rstrip() + "..."
@@ -1740,6 +1735,14 @@ class MarketAgent(BaseAgent):
                 "provider": provider,
             },
         )
+
+    def _sector_debug_snapshot_source(self):
+        for provider in getattr(self.provider_manager, "providers", []):
+            sector_source = getattr(provider, "sector_source", None)
+            debug_source = getattr(sector_source, "debug_snapshot", None)
+            if callable(debug_source):
+                return debug_source
+        return None
 
     @staticmethod
     def _clean_debug_stock_query(raw_query: str) -> str:

@@ -1,5 +1,10 @@
 """市场数据服务。"""
 
+from src.market.aggregator import (
+    MarketDataAggregator,
+    MarketDataSnapshot,
+    get_market_data_aggregator,
+)
 from src.market.akshare_source import (
     AkShareError,
     AkShareSource,
@@ -57,6 +62,8 @@ __all__ = [
     "MASnapshot",
     "MAX_QUOTE_AGE_SECONDS",
     "MarketDataError",
+    "MarketDataAggregator",
+    "MarketDataSnapshot",
     "MarketDataService",
     "LayeredObservationBuilder",
     "LayeredObservationReport",
@@ -74,6 +81,7 @@ __all__ = [
     "StrongStockScreener",
     "StockInfo",
     "get_market_data_service",
+    "get_market_data_aggregator",
     "get_observation_pool_manager",
     "get_stock_resolver",
     "get_stock_screener",

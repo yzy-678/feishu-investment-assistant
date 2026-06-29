@@ -31,8 +31,9 @@ from src.market import (
     QuoteSnapshot,
     StockInfo,
 )
+from src.providers.base import ProviderResult
 from src.rating import DataQualityItem, DataQualityReport, InvestmentRating, RatingLevel
-from src.rating import SectorContext, SectorProvider
+from src.rating import SectorContext
 
 
 # ── 辅助: 创建测试用自选股 ─────────────────────────────
@@ -190,22 +191,36 @@ def mock_deps():
         mock_rating_engine.return_value = mock_rating_engine_instance
 
         agent = MarketAgent()
-        agent.sector_provider = SectorProvider(akshare_provider=mock_mds_instance)
-        agent.eastmoney_raw_sector_source = SimpleNamespace(
-            debug_snapshot=lambda symbol: {
-                "provider": "EastMoneyRawSectorSource",
-                "symbol": symbol,
-                "stock_get": {
-                    "status_code": 200,
-                    "f127_industry": "银行",
-                    "f128_region_sector": "广东板块",
-                },
-                "hot_keyword": {
-                    "status_code": 200,
-                    "row_count": 2,
-                    "concepts": ["互联金融", "破净股"],
-                },
-            }
+        agent.provider_manager = SimpleNamespace(
+            get_sector=lambda symbol: ProviderResult.success(
+                SectorContext(
+                    name="平安银行",
+                    industry="银行",
+                    concepts=["互联金融", "破净股"],
+                    data_source="AkShare",
+                ),
+                "AkShare",
+            ),
+            providers=[
+                SimpleNamespace(
+                    sector_source=SimpleNamespace(
+                        debug_snapshot=lambda symbol: {
+                            "provider": "EastMoneyRawSectorSource",
+                            "symbol": symbol,
+                            "stock_get": {
+                                "status_code": 200,
+                                "f127_industry": "银行",
+                                "f128_region_sector": "广东板块",
+                            },
+                            "hot_keyword": {
+                                "status_code": 200,
+                                "row_count": 2,
+                                "concepts": ["互联金融", "破净股"],
+                            },
+                        }
+                    )
+                )
+            ],
         )
         yield {
             "agent": agent,
@@ -579,8 +594,8 @@ class TestHandle:
         assert "AI 分析文本质量校验未通过" in resp.message
         assert resp.message.startswith("【数据卡片】")
 
-    def test_handle_stock_uses_akshare_data_via_market_service(self, mock_deps):
-        """个股分析应通过 MarketDataService 注入 AkShare 历史/技术/行业数据。"""
+    def test_handle_stock_uses_market_service_and_provider_manager_data(self, mock_deps):
+        """个股分析应通过兼容服务取行情技术，并通过 ProviderManager 取板块。"""
         mock_deps["agent"].handle("session1", "分析 000001")
 
         mock_deps["market_data"].get_quote.assert_called_with(
@@ -593,7 +608,6 @@ class TestHandle:
         )
         mock_deps["market_data"].get_ma.assert_called_once_with("000001")
         mock_deps["market_data"].get_macd.assert_called_once_with("000001")
-        mock_deps["market_data"].get_stock_info.assert_called_once_with("000001")
 
         kwargs = mock_deps["deepseek"].chat_with_memory.call_args.kwargs
         prompt_context = "\n".join(kwargs["system_messages"])
@@ -631,30 +645,37 @@ class TestHandle:
         mock_deps["deepseek"].chat_with_memory.assert_not_called()
 
     def test_admin_can_debug_sector_without_calling_deepseek(self, mock_deps):
-        mock_deps["agent"].sector_provider = SimpleNamespace(
-            get_sector_context=lambda symbol: SectorContext(
-                name="中瓷电子",
-                industry="通信设备",
-                concepts=["先进封装", "商业航天"],
-                data_source="EastMoneyRaw, EastMoneyHotKeyword",
-            )
-        )
-        mock_deps["agent"].eastmoney_raw_sector_source = SimpleNamespace(
-            debug_snapshot=lambda symbol: {
-                "provider": "EastMoneyRawSectorSource",
-                "symbol": symbol,
-                "stock_get": {
-                    "status_code": 200,
-                    "f58_name": "中瓷电子",
-                    "f127_industry": "通信设备",
-                    "f128_region_sector": "河北板块",
-                },
-                "hot_keyword": {
-                    "status_code": 200,
-                    "row_count": 2,
-                    "concepts": ["先进封装", "商业航天"],
-                },
-            }
+        mock_deps["agent"].provider_manager = SimpleNamespace(
+            get_sector=lambda symbol: ProviderResult.success(
+                SectorContext(
+                    name="中瓷电子",
+                    industry="通信设备",
+                    concepts=["先进封装", "商业航天"],
+                    data_source="EastMoneyRaw, EastMoneyHotKeyword",
+                ),
+                "EastMoneyRaw, EastMoneyHotKeyword",
+            ),
+            providers=[
+                SimpleNamespace(
+                    sector_source=SimpleNamespace(
+                        debug_snapshot=lambda symbol: {
+                            "provider": "EastMoneyRawSectorSource",
+                            "symbol": symbol,
+                            "stock_get": {
+                                "status_code": 200,
+                                "f58_name": "中瓷电子",
+                                "f127_industry": "通信设备",
+                                "f128_region_sector": "河北板块",
+                            },
+                            "hot_keyword": {
+                                "status_code": 200,
+                                "row_count": 2,
+                                "concepts": ["先进封装", "商业航天"],
+                            },
+                        }
+                    )
+                )
+            ],
         )
 
         with patch(
@@ -1011,6 +1032,17 @@ class TestAnalyzeStock:
             mock_deps["market_data"].get_macd.return_value = value
         elif field == "stock_info":
             mock_deps["market_data"].get_stock_info.return_value = value
+            mock_deps["agent"].provider_manager = SimpleNamespace(
+                get_sector=lambda symbol: ProviderResult.success(
+                    SectorContext(
+                        name="平安银行",
+                        industry="银行",
+                        concepts=[],
+                        data_source="AkShare",
+                    ),
+                    "AkShare",
+                )
+            )
 
         result = mock_deps["agent"].analyze_stock("000001")
 
@@ -1028,6 +1060,17 @@ class TestAnalyzeStock:
             industry="银行",
             concepts=[],
         )
+        mock_deps["agent"].provider_manager = SimpleNamespace(
+            get_sector=lambda symbol: ProviderResult.success(
+                SectorContext(
+                    name="平安银行",
+                    industry="银行",
+                    concepts=[],
+                    data_source="AkShare",
+                ),
+                "AkShare",
+            )
+        )
 
         result = mock_deps["agent"].analyze_stock("000001")
 
@@ -1039,12 +1082,15 @@ class TestAnalyzeStock:
         self,
         mock_deps,
     ):
-        mock_deps["agent"].sector_provider = SimpleNamespace(
-            get_sector_context=lambda symbol: SectorContext(
-                name="中瓷电子",
-                industry="通信设备",
-                concepts=[],
-                data_source="EastMoneyRaw",
+        mock_deps["agent"].provider_manager = SimpleNamespace(
+            get_sector=lambda symbol: ProviderResult.success(
+                SectorContext(
+                    name="中瓷电子",
+                    industry="通信设备",
+                    concepts=[],
+                    data_source="EastMoneyRaw",
+                ),
+                "EastMoneyRaw",
             )
         )
 
@@ -1064,11 +1110,11 @@ class TestAnalyzeStock:
         assert "技术指标暂缺" in result
         mock_deps["deepseek"].chat.assert_called_once()
 
-    def test_handle_stock_data_failure_returns_fixed_message_without_llm(
+    def test_handle_stock_data_failure_degrades_with_provider_sector(
         self,
         mock_deps,
     ):
-        """普通聊天入口遇到个股数据失败时，也必须直接返回固定文案。"""
+        """普通聊天入口遇到行情/技术失败时，板块 provider 可用则降级返回。"""
         mock_deps["market_data"].get_quote.side_effect = MarketDataError(
             "timeout",
             reason="timeout",
@@ -1081,16 +1127,16 @@ class TestAnalyzeStock:
         resp = mock_deps["agent"].handle("session1", "分析 000001")
 
         assert resp.success is True
-        assert resp.message.startswith(STOCK_DATA_FAILURE_MESSAGE)
-        assert "失败层级：MarketDataService" in resp.message
-        assert resp.metadata["data_available"] is False
-        mock_deps["deepseek"].chat_with_memory.assert_not_called()
+        assert resp.message.startswith("【数据卡片】")
+        assert "实时行情暂缺" in resp.message
+        assert "行业：银行" in resp.message
+        mock_deps["deepseek"].chat_with_memory.assert_called_once()
 
-    def test_handle_bare_stock_name_uses_market_gate_without_llm_on_failure(
+    def test_handle_bare_stock_name_degrades_with_provider_sector_on_failure(
         self,
         mock_deps,
     ):
-        """裸股票名进入 MarketAgent 后，也必须执行实时数据硬门禁。"""
+        """裸股票名进入 MarketAgent 后，行情失败但 provider 可用时仍返回结果。"""
         mock_deps["market_data"].get_quote.side_effect = MarketDataError(
             "timeout",
             reason="timeout",
@@ -1102,13 +1148,13 @@ class TestAnalyzeStock:
 
         resp = mock_deps["agent"].handle("session1", "有研新材")
 
-        assert resp.message.startswith(STOCK_DATA_FAILURE_MESSAGE)
-        assert "失败层级：MarketDataService" in resp.message
+        assert resp.message.startswith("【数据卡片】")
+        assert "实时行情暂缺" in resp.message
         mock_deps["market_data"].get_quote.assert_called_with(
             "600206",
             market="CN",
         )
-        mock_deps["deepseek"].chat_with_memory.assert_not_called()
+        mock_deps["deepseek"].chat_with_memory.assert_called_once()
 
 
 # ═══════════════════════════════════════════════════════════

@@ -1,7 +1,9 @@
 """Unified data provider interfaces."""
 
 from src.providers.base import (
+    BaseProvider,
     KlineProvider,
+    ProviderConfig,
     ProviderResult,
     ProviderStatus,
     RealtimeQuoteProvider,
@@ -22,6 +24,7 @@ from src.providers.health import (
 
 __all__ = [
     "AkShareHistoryHealthCheck",
+    "BaseProvider",
     "CacheManager",
     "CacheHealthCheck",
     "CachedKlineProvider",
@@ -31,6 +34,7 @@ __all__ = [
     "HealthMonitor",
     "HealthStatus",
     "KlineProvider",
+    "ProviderConfig",
     "ProviderResult",
     "ProviderStatus",
     "RealtimeQuoteProvider",

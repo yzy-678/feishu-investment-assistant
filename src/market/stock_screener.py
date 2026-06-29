@@ -12,6 +12,7 @@ from typing import Any, Optional, Protocol
 
 from src.market.akshare_source import AkShareError, HistoryBar
 from src.market.provider_utils import ProviderTimeoutError, run_with_timeout
+from src.providers.provider_manager import ProviderManager, get_provider_manager
 
 logger = logging.getLogger(__name__)
 
@@ -215,11 +216,55 @@ class AkShareProvider:
         return self._ak
 
 
+class ProviderManagerStockDataProvider:
+    """StrongStockScreener adapter backed by ProviderManager."""
+
+    def __init__(self, provider_manager: Optional[ProviderManager] = None) -> None:
+        self.provider_manager = provider_manager or get_provider_manager()
+
+    def get_realtime_quotes(self) -> list[RealtimeQuote]:
+        for provider in self.provider_manager.providers:
+            getter = getattr(provider, "get_realtime_quotes", None)
+            if not callable(getter):
+                continue
+            result = getter()
+            if result.ok and result.data:
+                return [_quote_from_record(row) for row in result.data]
+        return []
+
+    def get_history(self, symbol: str, period: int = 60) -> list[HistoryBar]:
+        result = self.provider_manager.get_kline(symbol, period=period)
+        return list(result.data or [])
+
+    def get_hot_sectors(self, limit: int = 10) -> set[str]:
+        for provider in self.provider_manager.providers:
+            getter = getattr(provider, "get_hot_sectors", None)
+            if not callable(getter):
+                continue
+            result = getter(limit=limit)
+            if result.ok and result.data:
+                return set(result.data)
+        return set()
+
+    def get_index_change_pct(self) -> float:
+        index_quotes = self.provider_manager.get_index_quotes()
+        if index_quotes.ok and index_quotes.data:
+            return _average([quote.change_pct for quote in index_quotes.data])
+        for provider in self.provider_manager.providers:
+            getter = getattr(provider, "get_index_change_pct", None)
+            if not callable(getter):
+                continue
+            result = getter()
+            if result.ok and result.data is not None:
+                return float(result.data)
+        return 0.0
+
+
 class StrongStockScreener:
     """全市场强势股筛选器。"""
 
     def __init__(self, provider: Optional[StockDataProvider] = None) -> None:
-        self.provider = provider or AkShareProvider()
+        self.provider = provider or ProviderManagerStockDataProvider()
 
     def screen_top_stocks(self, limit: int = 20) -> list[StockCandidate]:
         """扫描并返回 Top20 强势股候选。
@@ -522,6 +567,18 @@ def _records(frame: Any, tail: Optional[int] = None) -> list[dict[str, Any]]:
             return []
         records = frame.to_dict("records")
     return [dict(row) for row in records if isinstance(row, dict)]
+
+
+def _quote_from_record(row: dict[str, Any]) -> RealtimeQuote:
+    return RealtimeQuote(
+        symbol=_first_value(row, ("代码", "code", "symbol")),
+        name=_first_value(row, ("名称", "name")),
+        industry=_first_value(row, ("所属行业", "行业", "industry")),
+        price=_to_float(_first_value(row, ("最新价", "price", "最新"))),
+        change_pct=_to_float(_first_value(row, ("涨跌幅", "change_pct"))),
+        volume=_to_float(_first_value(row, ("成交量", "volume"))),
+        amount=_to_float(_first_value(row, ("成交额", "amount"))),
+    )
 
 
 def _first_value(row: dict[str, Any], keys: tuple[str, ...]) -> str:
