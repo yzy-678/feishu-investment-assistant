@@ -105,6 +105,30 @@ class FakeHTTPClient:
         return FakeHTTPResponse(self.hot_payload)
 
 
+class FlakyStockHTTPClient:
+    def __init__(self):
+        self.get_calls = []
+        self.post_calls = []
+
+    def get(self, url, params=None):
+        self.get_calls.append((url, params or {}))
+        if len(self.get_calls) == 1:
+            raise RuntimeError("first host unavailable")
+        return FakeHTTPResponse(
+            {
+                "data": {
+                    "f58": "中瓷电子",
+                    "f127": "通信设备",
+                    "f128": "河北板块",
+                }
+            }
+        )
+
+    def post(self, url, json=None):
+        self.post_calls.append((url, json or {}))
+        return FakeHTTPResponse({"data": []})
+
+
 class FakeSectorContextProvider:
     def __init__(self, context=None, error=None):
         self.context = context or SectorContext()
@@ -273,6 +297,16 @@ def test_eastmoney_raw_sector_source_parses_f127_industry():
     assert context.industry == "消费电子"
     assert context.region_sector == "广东板块"
     assert context.available is True
+
+
+def test_eastmoney_raw_sector_source_falls_back_to_next_host_for_industry():
+    client = FlakyStockHTTPClient()
+
+    context = EastMoneyRawSectorSource(client=client).get_sector_context("003031")
+
+    assert context.name == "中瓷电子"
+    assert context.industry == "通信设备"
+    assert len(client.get_calls) >= 2
 
 
 def test_eastmoney_raw_sector_source_does_not_treat_f128_as_concept():

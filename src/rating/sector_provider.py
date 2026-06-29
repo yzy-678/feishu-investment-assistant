@@ -13,6 +13,12 @@ from src.market.akshare_source import StockInfo
 logger = logging.getLogger(__name__)
 
 EASTMONEY_STOCK_URL = "https://push2.eastmoney.com/api/qt/stock/get"
+EASTMONEY_STOCK_URLS: tuple[str, ...] = (
+    "https://push2delay.eastmoney.com/api/qt/stock/get",
+    EASTMONEY_STOCK_URL,
+    "https://82.push2.eastmoney.com/api/qt/stock/get",
+    "https://81.push2.eastmoney.com/api/qt/stock/get",
+)
 EASTMONEY_HOT_KEYWORD_URL = (
     "https://emappdata.eastmoney.com/stockrank/getHotStockRankList"
 )
@@ -101,37 +107,49 @@ class EastMoneyRawSectorSource:
             "hot_keyword": {},
         }
 
-        try:
-            response = self._get(
-                EASTMONEY_STOCK_URL,
-                params={
-                    "fltt": "2",
-                    "invt": "2",
-                    "fields": "f57,f58,f127,f128",
-                    "secid": f"{market_code}.{symbol}",
-                },
-            )
-            status_code = getattr(response, "status_code", "")
-            payload = response.json() or {}
-            data = payload.get("data") or {}
-            snapshot["stock_get"] = {
-                "status_code": status_code,
-                "has_data": bool(data),
-                "f58_name": data.get("f58"),
-                "f127_industry": data.get("f127"),
-                "f128_region_sector": data.get("f128"),
-                "raw_keys": list(data.keys())[:12] if isinstance(data, dict) else [],
-            }
-        except Exception as exc:
-            logger.warning(
-                "EastMoney raw sector debug industry failed: symbol=%s error=%s",
-                symbol,
-                exc,
-            )
-            snapshot["stock_get"] = {
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            }
+        stock_attempts: list[dict[str, Any]] = []
+        params = {
+            "fltt": "2",
+            "invt": "2",
+            "fields": "f57,f58,f127,f128",
+            "secid": f"{market_code}.{symbol}",
+        }
+        for url in EASTMONEY_STOCK_URLS:
+            try:
+                response = self._get(url, params=params)
+                status_code = getattr(response, "status_code", "")
+                payload = response.json() or {}
+                data = payload.get("data") or {}
+                attempt = {
+                    "url": url,
+                    "status_code": status_code,
+                    "has_data": bool(data),
+                    "f58_name": data.get("f58") if isinstance(data, dict) else None,
+                    "f127_industry": data.get("f127") if isinstance(data, dict) else None,
+                    "f128_region_sector": data.get("f128") if isinstance(data, dict) else None,
+                    "raw_keys": list(data.keys())[:12] if isinstance(data, dict) else [],
+                }
+                stock_attempts.append(attempt)
+                if str(attempt.get("f127_industry") or "").strip():
+                    snapshot["stock_get"] = {**attempt, "attempts": stock_attempts}
+                    break
+            except Exception as exc:
+                logger.warning(
+                    "EastMoney raw sector debug industry failed: symbol=%s "
+                    "url=%s error=%s",
+                    symbol,
+                    url,
+                    exc,
+                )
+                stock_attempts.append(
+                    {
+                        "url": url,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+        if not snapshot["stock_get"]:
+            snapshot["stock_get"] = {"attempts": stock_attempts}
 
         try:
             response = self._post(
@@ -171,25 +189,32 @@ class EastMoneyRawSectorSource:
 
     def _fetch_industry(self, symbol: str) -> SectorContext:
         market_code = "1" if str(symbol).startswith(("6", "688")) else "0"
-        try:
-            response = self._get(
-                EASTMONEY_STOCK_URL,
-                params={
-                    "fltt": "2",
-                    "invt": "2",
-                    "fields": "f57,f58,f127,f128",
-                    "secid": f"{market_code}.{symbol}",
-                },
-            )
-            response.raise_for_status()
-            data = (response.json() or {}).get("data") or {}
-        except Exception as exc:
-            logger.warning(
-                "EastMoney raw sector industry failed: symbol=%s error=%s",
-                symbol,
-                exc,
-            )
-            return SectorContext()
+        params = {
+            "fltt": "2",
+            "invt": "2",
+            "fields": "f57,f58,f127,f128",
+            "secid": f"{market_code}.{symbol}",
+        }
+        last_data: dict[str, Any] = {}
+        for url in EASTMONEY_STOCK_URLS:
+            try:
+                response = self._get(url, params=params)
+                response.raise_for_status()
+                data = (response.json() or {}).get("data") or {}
+            except Exception as exc:
+                logger.warning(
+                    "EastMoney raw sector industry failed: symbol=%s url=%s error=%s",
+                    symbol,
+                    url,
+                    exc,
+                )
+                continue
+            if isinstance(data, dict) and data:
+                last_data = data
+            if str(data.get("f127") or "").strip():
+                last_data = data
+                break
+        data = last_data
 
         industry = str(data.get("f127") or "").strip()
         return SectorContext(
@@ -235,7 +260,7 @@ class EastMoneyRawSectorSource:
             return self.client.get(url, params=params)
         with httpx.Client(
             timeout=self.timeout,
-            follow_redirects=False,
+            follow_redirects=True,
             trust_env=False,
         ) as client:
             return client.get(url, params=params)
@@ -245,7 +270,7 @@ class EastMoneyRawSectorSource:
             return self.client.post(url, json=json)
         with httpx.Client(
             timeout=self.timeout,
-            follow_redirects=False,
+            follow_redirects=True,
             trust_env=False,
         ) as client:
             return client.post(url, json=json)
