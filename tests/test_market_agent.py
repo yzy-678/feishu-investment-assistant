@@ -7,6 +7,7 @@ Prompt 注入、异常处理、边界条件、并发。
 所有外部依赖使用 mock。
 """
 
+import re
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
@@ -50,6 +51,21 @@ def make_watchlist_item(symbol: str, name: str, market: str = "a",
         notes=notes,
         added_at=datetime.now(),
     )
+
+
+def assert_institution_stock_card(text: str) -> None:
+    assert text.startswith("📊 个股卡片")
+    assert "📊 AI评分" in text
+    assert "📌 核心结论" in text
+    assert "📌 关键信号" in text
+    assert "⚠ 风险" in text
+    assert "【3条逻辑】" not in text
+    assert "【3条风险】" not in text
+    assert len(text) <= 600
+    signal_block = text.split("📌 关键信号", 1)[1].split("⚠ 风险", 1)[0]
+    risk_block = text.split("⚠ 风险", 1)[1]
+    assert len(re.findall(r"^\d+\.", signal_block, flags=re.M)) <= 3
+    assert len(re.findall(r"^\d+\.", risk_block, flags=re.M)) <= 2
 
 
 # ── Fixtures ─────────────────────────────────────────────
@@ -366,27 +382,19 @@ class TestHandle:
 
         resp = mock_deps["agent"].handle("session1", "分析 000001")
 
-        assert resp.message.startswith("【数据卡片】")
-        assert "股票代码：000001" in resp.message
-        assert "数据来源：EastMoney" in resp.message
-        assert "数据时间：2026-06-22 10:00:00" in resp.message
-        assert "当前价：10.52" in resp.message
+        assert_institution_stock_card(resp.message)
+        assert "平安银行（000001）" in resp.message
+        assert "来源：EastMoney｜2026-06-22 10:00:00" in resp.message
+        assert "价格：10.52" in resp.message
         assert "涨跌幅：-0.48%" in resp.message
         assert "成交额：0.98 亿" in resp.message
-        assert "MA5/MA20：MA5=10.8000，MA20=10.5500" in resp.message
-        assert "MACD：0.0800" in resp.message
-        assert "行业：银行" in resp.message
+        assert "技术：MA5 10.8000｜MA20 10.5500｜MACD 0.0800" in resp.message
+        assert "）｜银行" in resp.message
         assert "概念：互联金融、破净股" in resp.message
-        assert "📊 AI Investment Rating" in resp.message
-        assert "综合评级：A" in resp.message
-        assert "当前评分：88 /100" in resp.message
-        assert "昨日评分：84" in resp.message
-        assert "变化：⬆ +4" in resp.message
-        assert "✓ 放量突破/结构改善" in resp.message
-        assert "当前评级仅基于已接入的行情、技术和量价数据" in resp.message
-        assert "【核心结论】" in resp.message
-        assert "【3条逻辑】" in resp.message
-        assert "【3条风险】" in resp.message
+        assert "📊 AI评分" in resp.message
+        assert "综合：A｜88/100｜⬆ +4" in resp.message
+        assert "分项：趋势18｜量价17｜K线17｜强度18" in resp.message
+        assert "板块：已纳入｜昨日：84" in resp.message
         assert "AI 只负责解读" in resp.message
         mock_deps["rating_engine"].evaluate.assert_called_with("000001")
 
@@ -395,8 +403,8 @@ class TestHandle:
 
         kwargs = mock_deps["deepseek"].chat_with_memory.call_args.kwargs
         system_text = "\n".join(kwargs["system_messages"])
-        assert "默认个股分析控制在 600~900 字" in system_text
-        assert "数据卡片、Investment Rating、核心结论、3条逻辑、3条风险" in system_text
+        assert "默认总输出不超过600字" in system_text
+        assert "📊 个股卡片、📊 AI评分、📌 核心结论、📌 关键信号、⚠ 风险" in system_text
 
     def test_stock_prompt_uses_brief_length_when_requested(self, mock_deps):
         mock_deps["agent"].handle("session1", "简短分析 000001")
@@ -429,7 +437,8 @@ class TestHandle:
         block = MarketAgent._format_rating_block(rating)
 
         assert "板块：暂未纳入" in block
-        assert "提示：板块评分暂未纳入。" in block
+        assert "📊 AI评分" in block
+        assert "分项：趋势18｜量价17｜K线17｜强度18" in block
 
     def test_rating_block_displays_partial_sector_as_partially_included(self):
         rating = InvestmentRating(
@@ -492,7 +501,8 @@ class TestHandle:
 
         block = MarketAgent._format_rating_block(rating)
 
-        assert "数据质量：使用缓存；未纳入：板块评分" in block
+        assert "📊 AI评分" in block
+        assert "综合：A｜88/100｜⬆ +4" in block
 
     def test_handle_removes_llm_generated_quote_lines(self, mock_deps):
         """最终回复不得保留 LLM 生成/篡改的行情字段"""
@@ -512,7 +522,7 @@ class TestHandle:
 
         resp = mock_deps["agent"].handle("session1", "分析 000001")
 
-        assert "当前价：10.52" in resp.message
+        assert "价格：10.52" in resp.message
         assert "涨跌幅：-0.48%" in resp.message
         assert "LLM" not in resp.message
         assert "2099-01-01" not in resp.message
@@ -592,7 +602,7 @@ class TestHandle:
         assert garbled_b not in resp.message
         assert garbled_c not in resp.message
         assert "AI 分析文本质量校验未通过" in resp.message
-        assert resp.message.startswith("【数据卡片】")
+        assert resp.message.startswith("📊 个股卡片")
 
     def test_handle_stock_uses_market_service_and_provider_manager_data(self, mock_deps):
         """个股分析应通过兼容服务取行情技术，并通过 ProviderManager 取板块。"""
@@ -611,7 +621,7 @@ class TestHandle:
 
         kwargs = mock_deps["deepseek"].chat_with_memory.call_args.kwargs
         prompt_context = "\n".join(kwargs["system_messages"])
-        assert "【数据卡片】" in prompt_context
+        assert "📊 个股卡片" in prompt_context
         assert "【实时行情】" in prompt_context
         assert "【技术分析】" in prompt_context
         assert "【行业属性】" in prompt_context
@@ -811,7 +821,8 @@ class TestHandle:
 
         assert resp.success is True
         mock_deps["market_data"].get_quote.assert_called_with("600206", market="CN")
-        assert "股票名称：平安银行" in resp.message or "股票代码：600206" in resp.message
+        assert "平安银行（600206）" in resp.message
+        assert_institution_stock_card(resp.message)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -826,14 +837,12 @@ class TestAnalyzeStock:
         """个股分析"""
         mock_deps["deepseek"].chat.return_value = "平安银行分析结果"
         result = mock_deps["agent"].analyze_stock("000001")
-        assert result.startswith("【数据卡片】")
-        assert "数据来源：EastMoney" in result
-        assert "当前价：10.52" in result
-        assert "MA5/MA20：MA5=10.8000，MA20=10.5500" in result
-        assert "行业：银行" in result
-        assert "【核心结论】" in result
-        assert "【3条逻辑】" in result
-        assert "【3条风险】" in result
+        assert result.startswith("📊 个股卡片")
+        assert "来源：EastMoney" in result
+        assert "价格：10.52" in result
+        assert "技术：MA5 10.8000｜MA20 10.5500" in result
+        assert "）｜银行" in result
+        assert_institution_stock_card(result)
         assert "平安银行分析结果" in result
         mock_deps["deepseek"].chat.assert_called_once()
         assert mock_deps["deepseek"].chat.call_args.kwargs["temperature"] == 0.2
@@ -843,7 +852,7 @@ class TestAnalyzeStock:
         assert INVESTMENT_ASSISTANT_SYSTEM_PROMPT in messages[0]["content"]
         prompt = messages[1]["content"]
         assert "000001" in prompt
-        assert "【数据卡片】" in prompt
+        assert "📊 个股卡片" in prompt
         assert "【实时行情】" in prompt
         assert "数据来源：EastMoney" in prompt
         assert "【技术分析】" in prompt
@@ -897,7 +906,7 @@ class TestAnalyzeStock:
 
         result = mock_deps["agent"].analyze_stock("000001")
 
-        assert result.startswith("【数据卡片】")
+        assert result.startswith("📊 个股卡片")
         assert "实时行情暂缺" in result
         assert "基本面分析" in result
         mock_deps["deepseek"].chat.assert_called_once()
@@ -911,7 +920,7 @@ class TestAnalyzeStock:
 
         result = mock_deps["agent"].analyze_stock("000001")
 
-        assert result.startswith("【数据卡片】")
+        assert result.startswith("📊 个股卡片")
         assert "实时行情暂缺" in result
         mock_deps["deepseek"].chat.assert_called_once()
 
@@ -958,9 +967,9 @@ class TestAnalyzeStock:
         assert '"price": 10.52' in logs
         assert '"change_pct": -0.48' in logs
         assert "MarketAgent prompt quote data:" in logs
-        assert '"quote_block": "【数据卡片】' in logs
+        assert '"quote_block": "📊 个股卡片' in logs
         assert "MarketAgent final user data:" in logs
-        assert '"final_response": "【数据卡片】' in logs
+        assert '"final_response": "📊 个股卡片' in logs
 
     def test_missing_quote_fields_logged(self, mock_deps, caplog):
         caplog.set_level("INFO", logger="src.agents.market_agent")
@@ -1004,7 +1013,7 @@ class TestAnalyzeStock:
 
         result = mock_deps["agent"].analyze_stock("000001")
 
-        assert result.startswith("【数据卡片】")
+        assert result.startswith("📊 个股卡片")
         assert "实时行情暂缺" in result
         mock_deps["deepseek"].chat.assert_called_once()
 
@@ -1046,7 +1055,7 @@ class TestAnalyzeStock:
 
         result = mock_deps["agent"].analyze_stock("000001")
 
-        assert result.startswith("【数据卡片】")
+        assert result.startswith("📊 个股卡片")
         assert "技术指标暂缺" in result or "数据暂不可用" in result
         mock_deps["deepseek"].chat.assert_called_once()
 
@@ -1074,7 +1083,7 @@ class TestAnalyzeStock:
 
         result = mock_deps["agent"].analyze_stock("000001")
 
-        assert "行业：银行" in result
+        assert "）｜银行" in result
         assert "概念：数据暂不可用" in result
         assert "行业概念暂缺" not in result
 
@@ -1096,7 +1105,7 @@ class TestAnalyzeStock:
 
         result = mock_deps["agent"].analyze_stock("003031")
 
-        assert "行业：通信设备" in result
+        assert "）｜通信设备" in result
         assert "概念：数据暂不可用" in result
         assert "行业概念暂缺" not in result
 
@@ -1106,7 +1115,7 @@ class TestAnalyzeStock:
 
         result = mock_deps["agent"].analyze_stock("000001")
 
-        assert result.startswith("【数据卡片】")
+        assert result.startswith("📊 个股卡片")
         assert "技术指标暂缺" in result
         mock_deps["deepseek"].chat.assert_called_once()
 
@@ -1127,9 +1136,9 @@ class TestAnalyzeStock:
         resp = mock_deps["agent"].handle("session1", "分析 000001")
 
         assert resp.success is True
-        assert resp.message.startswith("【数据卡片】")
+        assert resp.message.startswith("📊 个股卡片")
         assert "实时行情暂缺" in resp.message
-        assert "行业：银行" in resp.message
+        assert "）｜银行" in resp.message
         mock_deps["deepseek"].chat_with_memory.assert_called_once()
 
     def test_handle_bare_stock_name_degrades_with_provider_sector_on_failure(
@@ -1148,7 +1157,7 @@ class TestAnalyzeStock:
 
         resp = mock_deps["agent"].handle("session1", "有研新材")
 
-        assert resp.message.startswith("【数据卡片】")
+        assert resp.message.startswith("📊 个股卡片")
         assert "实时行情暂缺" in resp.message
         mock_deps["market_data"].get_quote.assert_called_with(
             "600206",
